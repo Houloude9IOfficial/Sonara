@@ -1,0 +1,11 @@
+# Architecture status
+
+The repository currently delivers the portable, hardware-independent foundation and a single shared Flutter application for Windows and Android.
+
+Implemented and exercised: strict 32-byte PCM datagrams, certificate-pinned QUIC with `sonara/1` ALPN and disabled 0-RTT, one-time invitation authorization, active-probe and periodic UDP LAN session discovery, a stable DPAPI-protected Windows host identity, profile-driven initial clock exchange and 2 Hz streaming probes, direct event-driven WASAPI process-tree capture with Pro Audio scheduling, capture-QPC packet timestamps, bounded capture/render rings, readiness-gated Oboe startup, stale-audio skipping, real test-tone and process-audio transport, CLI WAV evidence, a standalone Windows UI with dynamic process/interface discovery and tray/background ownership, Android Rust/JNI receiving, Android foreground and screen-off lifecycle with scoped performance locks, bounded reorder/loss concealment, revisioned session lifecycle, bounded drift control, seeded network simulation, diagnostics export, and a responsive four-screen UI.
+
+Not yet implemented: persistent receiver identities and reconnect-time mutual TLS, user approval for a newly discovered receiver, native Windows speaker rendering, automatic reconnect, coordinated multi-output admission, and physical timing measurement. LAN discovery is convenience discovery, not an identity claim; the short-lived invitation still pins the QUIC certificate. These require the later hardware milestones in `PLAN.md`. Emulator evidence proves lifecycle, protocol, bounded PI rate correction, and native rendering execution, but intentionally does not claim qualified acoustic synchronization.
+
+The app targets the installed Android SDK 36. Raising it to API 37 is deferred until that SDK is installed and verified.
+
+Android production behavior is model-independent. Kotlin reports the current platform and route, Oboe accepts the platform-selected output rate and reports its actual stream configuration, and the callback resamples Sonara's negotiated wire clock into that output clock. Model names and emulator gateway addresses appear only in configurable qualification tooling or the hardware matrix.

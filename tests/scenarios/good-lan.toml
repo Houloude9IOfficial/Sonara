@@ -1,0 +1,9 @@
+name = "good-lan"
+duration_seconds = 3600.0
+seed = 7
+receiver_drift_ppm = 100.0
+base_one_way_ms = 2.0
+jitter_ms = 5.0
+loss_percent = 1.0
+asymmetry_ms = 0.0
+

@@ -1,0 +1,15 @@
+/target/
+/.tmp-quic-*/
+/.tmp-wasapi-*/
+/.tmp-android-*/
+*.log
+run.json
+.idea/
+.vscode/
+apps/sonara/.dart_tool/
+apps/sonara/build/
+apps/sonara/.flutter-plugins-dependencies
+apps/sonara/android/.gradle/
+apps/sonara/windows/flutter/ephemeral/
+/dist
+/.tmp-manual-lowlat

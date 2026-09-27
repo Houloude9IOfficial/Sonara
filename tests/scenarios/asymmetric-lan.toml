@@ -1,0 +1,9 @@
+name = "asymmetric-lan"
+duration_seconds = 300.0
+seed = 19
+receiver_drift_ppm = -80.0
+base_one_way_ms = 5.0
+jitter_ms = 3.0
+loss_percent = 0.5
+asymmetry_ms = 4.0
+

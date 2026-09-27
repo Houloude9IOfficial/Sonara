@@ -1,0 +1,30 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: '1.92.0', components: 'rustfmt,clippy' }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: pwsh -File tests/integration/quic-loopback.ps1
+  flutter:
+    runs-on: windows-latest
+    defaults: { run: { working-directory: apps/sonara } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: '1.92.0', targets: 'aarch64-linux-android,x86_64-linux-android' }
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;28.2.13676358" "cmake;3.22.1"
+      - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter build windows --debug
+      - run: flutter build apk --debug

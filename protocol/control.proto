@@ -1,0 +1,9 @@
+syntax = "proto3";
+package sonara.v1;
+message Envelope { uint64 request_id = 1; uint64 expected_revision = 2; oneof body { Hello hello = 10; StreamConfig stream_config = 11; ClockProbe clock_probe = 12; DeviceStatus device_status = 13; Error error = 14; } }
+message Hello { uint32 protocol_major = 1; uint32 protocol_minor = 2; bytes device_identity = 3; repeated string features = 4; uint32 max_datagram_size = 5; }
+message StreamConfig { uint32 stream_id = 1; uint32 epoch = 2; uint32 sample_rate = 3; uint32 channels = 4; string codec = 5; uint64 presentation_delay_ns = 6; }
+message ClockProbe { uint64 probe_id = 1; uint64 t1_ns = 2; uint64 t2_ns = 3; uint64 t3_ns = 4; }
+message DeviceStatus { string state = 1; string timing_quality = 2; double drift_ppm = 3; double buffer_ms = 4; }
+message Error { string code = 1; string message = 2; }
+
