@@ -81,6 +81,10 @@ class _SonaraShellState extends State<SonaraShell> {
   StreamSubscription<List<DiscoveredHost>>? discoverySubscription;
   List<DiscoveredHost> discoveredHosts = const [];
   String? discoveryError;
+  bool autoReconnect = true;
+  bool autoConnectInFlight = false;
+  Set<String> trustedFingerprints = const {};
+  String? lastAutoInvitationId;
   Timer? statusTimer;
   ListeningMode mode = ListeningMode.lowDelay;
   BufferProfile profile = BufferProfile.balanced;
@@ -110,7 +114,10 @@ class _SonaraShellState extends State<SonaraShell> {
         (_) => refreshReceiverStatus(),
       );
       refreshReceiverStatus();
-      if (Platform.isAndroid) startDiscovery();
+      if (Platform.isAndroid) {
+        refreshTrustState();
+        startDiscovery();
+      }
     } else if (defaultTargetPlatform == TargetPlatform.windows) {
       refreshSources();
       refreshHostStatus();
@@ -136,9 +143,12 @@ class _SonaraShellState extends State<SonaraShell> {
       final raw = await receiverChannel.invokeMethod<String>('status');
       if (raw == null || !mounted) return;
       final parsed = jsonDecode(raw) as Map<String, dynamic>;
+      final nextState = parsed['state'] as String? ?? 'unknown';
+      final becamePlaying =
+          nextState == 'playing' && receiverState != 'playing';
       setState(() {
         receiverStatus = parsed;
-        receiverState = parsed['state'] as String? ?? 'unknown';
+        receiverState = nextState;
         outputs.first
           ..name = parsed['platform_model'] as String? ?? 'Current device'
           ..route = parsed['output_route'] as String? ?? 'Platform default'
@@ -146,6 +156,7 @@ class _SonaraShellState extends State<SonaraShell> {
               ? 'Timestamp observed'
               : 'Timing not measured';
       });
+      if (becamePlaying) unawaited(refreshTrustState());
     } catch (_) {
       // The native receiver is Android-only; the desktop UI remains usable.
     }
@@ -161,6 +172,7 @@ class _SonaraShellState extends State<SonaraShell> {
           discoveredHosts = hosts;
           discoveryError = null;
         });
+        unawaited(maybeAutoConnect(hosts));
       },
       onError: (Object error) {
         if (mounted) {
@@ -186,26 +198,127 @@ class _SonaraShellState extends State<SonaraShell> {
     return null;
   }
 
-  Future<void> connectInvitation(Object? value) async {
+  Future<void> connectInvitation(
+    Object? value, {
+    bool trust = true,
+    bool quiet = false,
+  }) async {
     final invitation = value is String ? value.trim() : '';
     final validation = validateInvitation(invitation);
     if (validation != null) {
-      showError(validation);
+      if (!quiet) showError(validation);
       return;
     }
     try {
       final started = await receiverChannel.invokeMethod<bool>('start', {
         'invitation': invitation,
+        'trust': trust,
       });
       if (started != true) {
-        showError('Android did not start the receiver.');
+        if (!quiet) showError('Android did not start the receiver.');
         return;
       }
+      if (trust) await refreshTrustState();
       await refreshReceiverStatus();
     } on PlatformException catch (error) {
-      showError(error.message ?? 'Could not start receiver');
+      if (!quiet) showError(error.message ?? 'Could not start receiver');
     } catch (error) {
-      showError('Could not start receiver: $error');
+      if (!quiet) showError('Could not start receiver: $error');
+    }
+  }
+
+  Future<void> refreshTrustState() async {
+    try {
+      final raw = await receiverChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'trustState',
+      );
+      if (raw == null || !mounted) return;
+      final fingerprints = (raw['fingerprints'] as List<dynamic>? ?? const [])
+          .whereType<String>()
+          .toSet();
+      setState(() {
+        autoReconnect = raw['auto_reconnect'] as bool? ?? true;
+        trustedFingerprints = fingerprints;
+      });
+      unawaited(maybeAutoConnect(discoveredHosts));
+    } catch (_) {}
+  }
+
+  Future<void> setAutoReconnect(bool enabled) async {
+    final applied = await receiverChannel.invokeMethod<bool>(
+      'setAutoReconnect',
+      {'enabled': enabled},
+    );
+    if (mounted) setState(() => autoReconnect = applied ?? enabled);
+    if (enabled) unawaited(maybeAutoConnect(discoveredHosts));
+  }
+
+  Future<void> forgetTrusted(String fingerprint) async {
+    await receiverChannel.invokeMethod<bool>('forgetTrusted', {
+      'fingerprint': fingerprint,
+    });
+    await refreshTrustState();
+  }
+
+  Future<void> copyDiagnostics() async {
+    final report = <String, dynamic>{
+      'generated_at': DateTime.now().toUtc().toIso8601String(),
+      'platform': defaultTargetPlatform.name,
+      'session': defaultTargetPlatform == TargetPlatform.windows
+          ? hostStatus
+          : receiverStatus,
+      'trusted_host_count': trustedFingerprints.length,
+      'auto_reconnect': autoReconnect,
+    };
+    await Clipboard.setData(
+      ClipboardData(text: const JsonEncoder.withIndent('  ').convert(report)),
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Diagnostics copied to the clipboard.')),
+    );
+  }
+
+  String get timingConfidence {
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return streaming ? 'Awaiting receiver measurements' : 'Not measured';
+    }
+    if (receiverState != 'playing') return 'Not measured';
+    final uncertainty = (receiverStatus['clock_uncertainty_ms'] as num?)
+        ?.toDouble();
+    if (uncertainty == null) return 'Clock measurement unavailable';
+    if (uncertainty <= 2) return 'Clock synchronized';
+    if (uncertainty <= 5) return 'Clock stable';
+    return 'Clock settling';
+  }
+
+  String get timingExplanation {
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return 'Receivers share one timestamped presentation timeline. Acoustic measurement is required to qualify speaker-to-speaker alignment.';
+    }
+    final route = receiverStatus['output_route_type'] as String? ?? 'output';
+    return '$route · Network-clock confidence is measured live. Acoustic speaker delay is reported separately.';
+  }
+
+  Future<void> maybeAutoConnect(List<DiscoveredHost> hosts) async {
+    if (!mounted || !autoReconnect || receiverActive || autoConnectInFlight) {
+      return;
+    }
+    DiscoveredHost? candidate;
+    for (final host in hosts) {
+      if (trustedFingerprints.contains(host.hostFingerprint) &&
+          host.invitationId != lastAutoInvitationId) {
+        candidate = host;
+        break;
+      }
+    }
+    if (candidate == null) return;
+    autoConnectInFlight = true;
+    lastAutoInvitationId = candidate.invitationId;
+    try {
+      await connectInvitation(candidate.invitation, trust: false, quiet: true);
+    } finally {
+      autoConnectInFlight = false;
     }
   }
 
@@ -395,7 +508,7 @@ class _SonaraShellState extends State<SonaraShell> {
   Widget build(BuildContext context) {
     final wide = MediaQuery.sizeOf(context).width >= 760;
     return Scaffold(
-      appBar: wide ? null : AppBar(title: const Wordmark()),
+      // appBar: wide ? null : AppBar(title: const Wordmark()),
       bottomNavigationBar: wide
           ? null
           : NavigationBar(
@@ -476,7 +589,9 @@ class _SonaraShellState extends State<SonaraShell> {
               contentPadding: EdgeInsets.zero,
               leading: const CircleAvatar(child: Icon(Icons.computer)),
               title: Text(host.name),
-              subtitle: Text('${host.address} · encrypted Sonara session'),
+              subtitle: Text(
+                '${host.address} · ${trustedFingerprints.contains(host.hostFingerprint) ? 'trusted host' : 'encrypted session'}',
+              ),
               trailing: FilledButton(
                 onPressed: receiverActive
                     ? null
@@ -499,59 +614,55 @@ class _SonaraShellState extends State<SonaraShell> {
 
   Widget session() => ListView(
     children: [
-      const Heading(
+      Heading(
         'Session',
-        'Choose a source and the outputs Sonara controls.',
+        defaultTargetPlatform == TargetPlatform.windows
+            ? 'Choose an application and open a synchronized LAN session.'
+            : 'Connect this device to a nearby Sonara PC.',
       ),
       const SizedBox(height: 22),
-      Panel(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Label('SOURCE'),
-            const SizedBox(height: 10),
-            DropdownButtonFormField<String>(
-              key: ValueKey('source-$selectedSourcePid-${sources.length}'),
-              isExpanded: true,
-              initialValue: selectedSourcePid?.toString() ?? 'none',
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.apps),
-                labelText: 'Audio source',
-              ),
-              items: defaultTargetPlatform == TargetPlatform.windows
-                  ? [
-                      DropdownMenuItem(
-                        value: 'none',
-                        child: Text(
-                          sourcesLoading
-                              ? 'Finding running applications…'
-                              : 'Select a running application',
-                        ),
-                      ),
-                      for (final source in sources)
-                        DropdownMenuItem(
-                          value: source.pid.toString(),
-                          child: Text(
-                            '${source.name} — ${source.title}',
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                    ]
-                  : const [
-                      DropdownMenuItem(
-                        value: 'none',
-                        child: Text('Receive from a Sonara host'),
-                      ),
-                    ],
-              onChanged: streaming || hostBusy
-                  ? null
-                  : (value) => setState(
-                      () => selectedSourcePid = value == null || value == 'none'
-                          ? null
-                          : int.tryParse(value),
+      if (defaultTargetPlatform == TargetPlatform.windows) ...[
+        Panel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Label('SOURCE'),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                key: ValueKey('source-$selectedSourcePid-${sources.length}'),
+                isExpanded: true,
+                initialValue: selectedSourcePid?.toString() ?? 'none',
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.apps),
+                  labelText: 'Audio source',
+                ),
+                items: [
+                  DropdownMenuItem(
+                    value: 'none',
+                    child: Text(
+                      sourcesLoading
+                          ? 'Finding running applications…'
+                          : 'Select a running application',
                     ),
-            ),
-            if (defaultTargetPlatform == TargetPlatform.windows)
+                  ),
+                  for (final source in sources)
+                    DropdownMenuItem(
+                      value: source.pid.toString(),
+                      child: Text(
+                        '${source.name} — ${source.title}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+                onChanged: streaming || hostBusy
+                    ? null
+                    : (value) => setState(
+                        () =>
+                            selectedSourcePid = value == null || value == 'none'
+                            ? null
+                            : int.tryParse(value),
+                      ),
+              ),
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton.icon(
@@ -562,17 +673,16 @@ class _SonaraShellState extends State<SonaraShell> {
                   label: const Text('Refresh apps'),
                 ),
               ),
-            const SizedBox(height: 12),
-            Text(
-              defaultTargetPlatform == TargetPlatform.windows
-                  ? 'Capture copies audio. It cannot delay the app’s original speaker output.'
-                  : 'The native receiver follows the output route selected by Android.',
-              style: TextStyle(fontSize: 13),
-            ),
-          ],
+              const SizedBox(height: 12),
+              const Text(
+                'Capture copies audio. It cannot delay the app’s original speaker output.',
+                style: TextStyle(fontSize: 13),
+              ),
+            ],
+          ),
         ),
-      ),
-      const SizedBox(height: 16),
+        const SizedBox(height: 16),
+      ],
       if (defaultTargetPlatform == TargetPlatform.android) ...[
         nearbyHostsPanel(),
         const SizedBox(height: 16),
@@ -630,63 +740,78 @@ class _SonaraShellState extends State<SonaraShell> {
                 const SizedBox(height: 8),
                 const Text('Starting the secure host…'),
               ],
-            ] else
-              for (final o in outputs)
-                OutputRow(
-                  output: o,
-                  enabled: !streaming,
-                  onChanged: (v) => setState(() => o.selected = v ?? false),
+            ] else ...[
+              const Divider(height: 24),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.speaker_phone_outlined),
+                title: Text(outputs.first.name),
+                subtitle: Text(
+                  '${outputs.first.route} · ${outputs.first.quality}',
                 ),
+                trailing: receiverActive
+                    ? const Chip(label: Text('Active'))
+                    : const Chip(label: Text('Ready')),
+              ),
+              const Text(
+                'Sonara follows Android’s current media output route. Change it from the system media output panel.',
+                style: TextStyle(fontSize: 13),
+              ),
+            ],
           ],
         ),
       ),
-      const SizedBox(height: 16),
-      Panel(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Label('LISTENING'),
-            const SizedBox(height: 14),
-            SegmentedButton<ListeningMode>(
-              segments: const [
-                ButtonSegment(
-                  value: ListeningMode.synchronized,
-                  label: Text('Synchronized'),
-                ),
-                ButtonSegment(
-                  value: ListeningMode.lowDelay,
-                  label: Text('Low delay'),
-                ),
-              ],
-              selected: {mode},
-              onSelectionChanged: streaming
-                  ? null
-                  : (v) => setState(() => mode = v.first),
-            ),
-            const SizedBox(height: 16),
-            DropdownButtonFormField<BufferProfile>(
-              isExpanded: true,
-              initialValue: profile,
-              decoration: const InputDecoration(labelText: 'Buffer profile'),
-              items: const [
-                DropdownMenuItem(
-                  value: BufferProfile.ultraLow,
-                  child: Text('Ultra Low · adaptive 10–30 ms buffer'),
-                ),
-                DropdownMenuItem(
-                  value: BufferProfile.balanced,
-                  child: Text('Balanced · adaptive 20–60 ms buffer'),
-                ),
-                DropdownMenuItem(
-                  value: BufferProfile.stable,
-                  child: Text('Stable · adaptive 50–240 ms buffer'),
-                ),
-              ],
-              onChanged: streaming ? null : (v) => setState(() => profile = v!),
-            ),
-          ],
+      if (defaultTargetPlatform == TargetPlatform.windows) ...[
+        const SizedBox(height: 16),
+        Panel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Label('LISTENING'),
+              const SizedBox(height: 14),
+              SegmentedButton<ListeningMode>(
+                segments: const [
+                  ButtonSegment(
+                    value: ListeningMode.synchronized,
+                    label: Text('Synchronized'),
+                  ),
+                  ButtonSegment(
+                    value: ListeningMode.lowDelay,
+                    label: Text('Low delay'),
+                  ),
+                ],
+                selected: {mode},
+                onSelectionChanged: streaming
+                    ? null
+                    : (v) => setState(() => mode = v.first),
+              ),
+              const SizedBox(height: 16),
+              DropdownButtonFormField<BufferProfile>(
+                isExpanded: true,
+                initialValue: profile,
+                decoration: const InputDecoration(labelText: 'Buffer profile'),
+                items: const [
+                  DropdownMenuItem(
+                    value: BufferProfile.ultraLow,
+                    child: Text('Ultra Low · adaptive 10–30 ms buffer'),
+                  ),
+                  DropdownMenuItem(
+                    value: BufferProfile.balanced,
+                    child: Text('Balanced · adaptive 20–60 ms buffer'),
+                  ),
+                  DropdownMenuItem(
+                    value: BufferProfile.stable,
+                    child: Text('Stable · adaptive 50–240 ms buffer'),
+                  ),
+                ],
+                onChanged: streaming
+                    ? null
+                    : (v) => setState(() => profile = v!),
+              ),
+            ],
+          ),
         ),
-      ),
+      ],
       const SizedBox(height: 24),
       FilledButton.icon(
         onPressed: hostBusy
@@ -785,35 +910,36 @@ class _SonaraShellState extends State<SonaraShell> {
         ),
         const SizedBox(height: 14),
       ],
-      Card(
-        child: Column(
-          children: [
-            for (final o in outputs)
-              ListTile(
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 22,
-                  vertical: 8,
-                ),
-                leading: CircleAvatar(
-                  child: Icon(
-                    defaultTargetPlatform == TargetPlatform.windows
-                        ? Icons.computer_outlined
-                        : Icons.phone_android,
+      if (defaultTargetPlatform == TargetPlatform.android)
+        Card(
+          child: Column(
+            children: [
+              for (final o in outputs)
+                ListTile(
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 22,
+                    vertical: 8,
+                  ),
+                  leading: CircleAvatar(
+                    child: Icon(
+                      defaultTargetPlatform == TargetPlatform.windows
+                          ? Icons.computer_outlined
+                          : Icons.phone_android,
+                    ),
+                  ),
+                  title: Text(o.name),
+                  subtitle: Text('${o.route} · ${o.quality}'),
+                  trailing: Chip(
+                    label: Text(
+                      defaultTargetPlatform == TargetPlatform.windows
+                          ? 'Host'
+                          : 'Local',
+                    ),
                   ),
                 ),
-                title: Text(o.name),
-                subtitle: Text('${o.route} · ${o.quality}'),
-                trailing: Chip(
-                  label: Text(
-                    defaultTargetPlatform == TargetPlatform.windows
-                        ? 'Host'
-                        : 'Local',
-                  ),
-                ),
-              ),
-          ],
+            ],
+          ),
         ),
-      ),
       const SizedBox(height: 18),
       OutlinedButton.icon(
         onPressed: defaultTargetPlatform == TargetPlatform.android
@@ -902,30 +1028,28 @@ class _SonaraShellState extends State<SonaraShell> {
         ],
       ),
       const SizedBox(height: 20),
-      const Panel(
+      Panel(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Label('TIMING CONFIDENCE'),
-            SizedBox(height: 12),
+            const Label('TIMING CONFIDENCE'),
+            const SizedBox(height: 12),
             Text(
-              'Unknown',
-              style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+              timingConfidence,
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
             ),
-            SizedBox(height: 6),
-            Text(
-              '“Synced” is only shown after clock and output timestamps qualify. Bluetooth routes are best effort.',
-            ),
+            const SizedBox(height: 6),
+            Text(timingExplanation),
           ],
         ),
       ),
       const SizedBox(height: 18),
       OutlinedButton.icon(
-        onPressed: () {},
-        icon: const Icon(Icons.file_download_outlined),
+        onPressed: copyDiagnostics,
+        icon: const Icon(Icons.copy_all_outlined),
         label: const Padding(
           padding: EdgeInsets.all(12),
-          child: Text('Export privacy-scrubbed report'),
+          child: Text('Copy privacy-scrubbed diagnostics'),
         ),
       ),
     ],
@@ -941,29 +1065,52 @@ class _SonaraShellState extends State<SonaraShell> {
       Card(
         child: Column(
           children: [
-            SwitchListTile(
-              value: true,
-              onChanged: (_) {},
-              title: const Text('Explicit approval for each session'),
-              subtitle: const Text('Recommended for trusted paired devices'),
-            ),
-            const Divider(height: 1),
-            SwitchListTile(
-              value: startWithWindows,
-              onChanged: defaultTargetPlatform == TargetPlatform.windows
-                  ? setStartup
-                  : null,
-              title: const Text('Start with Windows'),
-              subtitle: const Text(
-                'Open Sonara in the notification area after sign-in',
+            if (defaultTargetPlatform == TargetPlatform.android)
+              SwitchListTile(
+                value: autoReconnect,
+                onChanged: setAutoReconnect,
+                title: const Text('Reconnect to trusted hosts'),
+                subtitle: const Text(
+                  'Connect automatically when an approved PC returns to this network',
+                ),
               ),
-            ),
-            const Divider(height: 1),
-            const ListTile(
-              title: Text('Maximum manual delay'),
-              subtitle: Text('1,000 ms'),
-              trailing: Icon(Icons.chevron_right),
-            ),
+            if (defaultTargetPlatform == TargetPlatform.windows)
+              SwitchListTile(
+                value: startWithWindows,
+                onChanged: setStartup,
+                title: const Text('Start with Windows'),
+                subtitle: const Text(
+                  'Open Sonara in the notification area after sign-in',
+                ),
+              ),
+            if (defaultTargetPlatform == TargetPlatform.android &&
+                trustedFingerprints.isNotEmpty) ...[
+              const Divider(height: 1),
+              for (final fingerprint in trustedFingerprints)
+                ListTile(
+                  leading: const Icon(Icons.verified_user_outlined),
+                  title: const Text('Trusted PC'),
+                  subtitle: Text(
+                    fingerprint.length > 16
+                        ? '${fingerprint.substring(0, 8)}…${fingerprint.substring(fingerprint.length - 8)}'
+                        : fingerprint,
+                  ),
+                  trailing: IconButton(
+                    tooltip: 'Forget this PC',
+                    onPressed: () => forgetTrusted(fingerprint),
+                    icon: const Icon(Icons.delete_outline),
+                  ),
+                ),
+            ],
+            if (defaultTargetPlatform == TargetPlatform.android &&
+                trustedFingerprints.isEmpty)
+              const ListTile(
+                leading: Icon(Icons.devices_outlined),
+                title: Text('No trusted PCs yet'),
+                subtitle: Text(
+                  'A PC becomes trusted after you connect to it manually.',
+                ),
+              ),
           ],
         ),
       ),
@@ -1031,12 +1178,20 @@ class SideNav extends StatelessWidget {
 class Wordmark extends StatelessWidget {
   const Wordmark({super.key});
   @override
-  Widget build(BuildContext context) => const Row(
+  Widget build(BuildContext context) => Row(
     mainAxisSize: MainAxisSize.min,
     children: [
-      Icon(Icons.waves_rounded, color: indigo),
-      SizedBox(width: 9),
-      Text(
+      ClipRRect(
+        borderRadius: BorderRadius.circular(7),
+        child: Image.asset(
+          'assets/branding/app_mark.png',
+          width: 28,
+          height: 28,
+          filterQuality: FilterQuality.high,
+        ),
+      ),
+      const SizedBox(width: 9),
+      const Text(
         'sonara',
         style: TextStyle(
           fontSize: 22,

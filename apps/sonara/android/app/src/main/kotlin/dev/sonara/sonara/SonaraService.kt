@@ -22,6 +22,12 @@ class SonaraService : Service() {
     private var statusThread: Thread? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var activeInvitation: String? = null
+    private var autoReconnect = true
+    private var reconnectDeadlineMs = 0L
+    private var retryIndex = 0
+    private var trustRequested = false
+    private var trustPersisted = false
 
     override fun onCreate() {
         super.onCreate()
@@ -37,6 +43,13 @@ class SonaraService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        activeInvitation = invitation
+        activeHostFingerprint = intent.getStringExtra(MainActivity.EXTRA_HOST_FINGERPRINT)
+        trustRequested = intent.getBooleanExtra(MainActivity.EXTRA_TRUST_REQUESTED, false)
+        trustPersisted = false
+        autoReconnect = intent.getBooleanExtra(MainActivity.EXTRA_AUTO_RECONNECT, true)
+        reconnectDeadlineMs = System.currentTimeMillis() + 60_000L
+        retryIndex = 0
         nativeStart(invitation)
         beginStatusPolling()
         return START_NOT_STICKY
@@ -51,6 +64,7 @@ class SonaraService : Service() {
         wifiLock = null
         wakeLock?.takeIf { it.isHeld }?.release()
         wakeLock = null
+        activeHostFingerprint = null
         super.onDestroy()
     }
 
@@ -70,6 +84,38 @@ class SonaraService : Service() {
                     stopSelf()
                     break
                 }
+                if (state == "playing") {
+                    retryIndex = 0
+                    persistTrustAfterAuthentication()
+                }
+                if (state == "error") {
+                    val error = JSONObject(lastStatus).optString("error")
+                    val permanent = error.contains("expired", ignoreCase = true) ||
+                        error.contains("invalid invitation", ignoreCase = true) ||
+                        error.contains("rejected", ignoreCase = true) ||
+                        error.contains("authorization", ignoreCase = true)
+                    val invitation = activeInvitation
+                    if (!autoReconnect || permanent || invitation == null ||
+                        System.currentTimeMillis() >= reconnectDeadlineMs
+                    ) {
+                        stopSelf()
+                        break
+                    }
+                    val baseDelay = RETRY_DELAYS_MS[minOf(retryIndex, RETRY_DELAYS_MS.lastIndex)]
+                    val jitterWindow = maxOf(1L, baseDelay / 5L)
+                    val jitter = (System.nanoTime() % (jitterWindow * 2L + 1L)) - jitterWindow
+                    val delay = maxOf(100L, baseDelay + jitter)
+                    retryIndex++
+                    getSystemService(NotificationManager::class.java)
+                        .notify(NOTIFICATION_ID, notification("Reconnecting in ${delay / 1000.0}s"))
+                    try {
+                        Thread.sleep(delay)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    nativeStart(invitation)
+                    continue
+                }
                 try {
                     Thread.sleep(500)
                 } catch (_: InterruptedException) {
@@ -77,6 +123,16 @@ class SonaraService : Service() {
                 }
             }
         }, "sonara-status").also { it.start() }
+    }
+
+    private fun persistTrustAfterAuthentication() {
+        if (!trustRequested || trustPersisted) return
+        val fingerprint = activeHostFingerprint?.takeIf { it.isNotBlank() } ?: return
+        val preferences = getSharedPreferences(MainActivity.PREFERENCES, MODE_PRIVATE)
+        val trusted = preferences.getStringSet(MainActivity.KEY_TRUSTED, emptySet())!!.toMutableSet()
+        trusted.add(fingerprint)
+        preferences.edit().putStringSet(MainActivity.KEY_TRUSTED, trusted).apply()
+        trustPersisted = true
     }
 
     @Suppress("DEPRECATION")
@@ -173,9 +229,14 @@ class SonaraService : Service() {
     companion object {
         private const val CHANNEL_ID = "sonara_receiver"
         private const val NOTIFICATION_ID = 1
+        private val RETRY_DELAYS_MS = longArrayOf(500, 1_000, 2_000, 4_000, 8_000)
 
         @Volatile
         var lastStatus: String = "{\"state\":\"idle\"}"
+            private set
+
+        @Volatile
+        var activeHostFingerprint: String? = null
             private set
 
         init {

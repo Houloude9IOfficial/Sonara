@@ -38,6 +38,11 @@ struct ReceiverStatus {
     packets_received: u64,
     packets_lost: u64,
     invalid_packets: u64,
+    redundant_packets: u64,
+    first_sequence: Option<u32>,
+    last_sequence: Option<u32>,
+    first_source_time_ns: Option<u64>,
+    last_source_time_ns: Option<u64>,
     frames_rendered: u64,
     output_underruns: u64,
     output_dropped_frames: u64,
@@ -100,6 +105,7 @@ enum ClockControl {
         offset_seconds: f64,
         uncertainty_ms: f64,
         samples: usize,
+        start_host_time_ns: u64,
     },
     PlaybackReady,
 }
@@ -296,12 +302,6 @@ pub extern "system" fn Java_dev_sonara_sonara_SonaraService_nativeStatus(
 
 async fn run_receiver(encoded: &str) -> Result<()> {
     let invitation = Invitation::decode(encoded, unix_now()).context("decoding invitation")?;
-    let endpoint_addr: SocketAddr = invitation
-        .endpoints
-        .first()
-        .context("invitation has no endpoint")?
-        .parse()
-        .context("invalid invitation endpoint")?;
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(
         invitation.host_certificate_der.clone(),
@@ -314,10 +314,7 @@ async fn run_receiver(encoded: &str) -> Result<()> {
     let config = quinn::ClientConfig::new(std::sync::Arc::new(QuicClientConfig::try_from(tls)?));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(config);
-    let connection = endpoint
-        .connect(endpoint_addr, "sonara.local")?
-        .await
-        .context("connecting to pinned Sonara host")?;
+    let connection = connect_to_any_endpoint(&endpoint, &invitation.endpoints).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     write_control(
         &mut send,
@@ -345,7 +342,14 @@ async fn run_receiver(encoded: &str) -> Result<()> {
         respond_to_clock(&mut send, &mut recv, receiver_clock).await?;
     }
     let ready: ClockControl = read_control(&mut recv).await?;
-    let ClockControl::Ready { uncertainty_ms, .. } = ready else {
+    let ClockControl::Ready {
+        rate,
+        offset_seconds,
+        uncertainty_ms,
+        start_host_time_ns,
+        ..
+    } = ready
+    else {
         bail!("host did not finish clock synchronization");
     };
     {
@@ -358,6 +362,15 @@ async fn run_receiver(encoded: &str) -> Result<()> {
             f64::from(response.frame_count) * 1000.0 / f64::from(LOGICAL_SAMPLE_RATE);
         status.mode = response.mode.clone();
         status.profile = response.profile.clone();
+    }
+    write_control(&mut send, &ClockControl::PlaybackReady).await?;
+    let receiver_start_seconds = rate * (start_host_time_ns as f64 / 1e9) + offset_seconds;
+    let startup_lead_seconds =
+        (f64::from(response.target_buffer_frames) / f64::from(LOGICAL_SAMPLE_RATE)).max(0.020);
+    let remaining_seconds =
+        receiver_start_seconds - receiver_clock.elapsed().as_secs_f64() - startup_lead_seconds;
+    if remaining_seconds > 0.0 {
+        tokio::time::sleep(Duration::from_secs_f64(remaining_seconds)).await;
     }
     let audio = AudioApi::load().context("loading Oboe adapter")?;
     audio.start_primed(response.target_buffer_frames)?;
@@ -372,7 +385,6 @@ async fn run_receiver(encoded: &str) -> Result<()> {
         .context("target buffer cannot be represented by the audio adapter")?;
     let priming_silence = vec![0u8; usize::from(priming_frames) * usize::from(CHANNELS) * 2];
     audio.write_pcm(&priming_silence, priming_frames)?;
-    write_control(&mut send, &ClockControl::PlaybackReady).await?;
     let control = tokio::spawn(async move {
         while !STOP.load(Ordering::Acquire) {
             if respond_to_clock(&mut send, &mut recv, receiver_clock)
@@ -429,13 +441,14 @@ async fn run_receiver(encoded: &str) -> Result<()> {
             }
         };
         let next = *expected.get_or_insert(packet.sequence);
-        if packet.sequence < next || reorder.insert(packet.sequence, packet).is_some() {
+        if packet.sequence < next || reorder.contains_key(&packet.sequence) {
             STATUS
                 .lock()
                 .expect("status mutex poisoned")
-                .invalid_packets += 1;
+                .redundant_packets += 1;
             continue;
         }
+        reorder.insert(packet.sequence, packet);
         STATUS
             .lock()
             .expect("status mutex poisoned")
@@ -445,6 +458,15 @@ async fn run_receiver(encoded: &str) -> Result<()> {
                 received_first_packet = true;
                 unsafe { (audio.reset_quality)() };
                 STATUS.lock().expect("status mutex poisoned").state = "playing".into();
+            }
+            {
+                let mut status = STATUS.lock().expect("status mutex poisoned");
+                status.first_sequence.get_or_insert(packet.sequence);
+                status.last_sequence = Some(packet.sequence);
+                status
+                    .first_source_time_ns
+                    .get_or_insert(packet.source_time_ns);
+                status.last_source_time_ns = Some(packet.source_time_ns);
             }
             audio.write_pcm(&packet.payload, packet.frame_count)?;
             *expected.as_mut().expect("sequence initialized") =
@@ -465,6 +487,44 @@ async fn run_receiver(encoded: &str) -> Result<()> {
     connection.close(0u32.into(), b"receiver stopped");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+async fn connect_to_any_endpoint(
+    endpoint: &quinn::Endpoint,
+    encoded_addresses: &[String],
+) -> Result<quinn::Connection> {
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut errors = Vec::new();
+    for encoded in encoded_addresses {
+        match encoded.parse::<SocketAddr>() {
+            Ok(address) => {
+                let endpoint = endpoint.clone();
+                attempts.spawn(async move {
+                    let connecting = endpoint.connect(address, "sonara.local")?;
+                    let connection = timeout(Duration::from_secs(8), connecting)
+                        .await
+                        .with_context(|| format!("connection to {address} timed out"))??;
+                    Ok::<_, anyhow::Error>((address, connection))
+                });
+            }
+            Err(error) => errors.push(format!("{encoded}: {error}")),
+        }
+    }
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok((_address, connection))) => {
+                attempts.abort_all();
+                return Ok(connection);
+            }
+            Ok(Err(error)) => errors.push(format!("{error:#}")),
+            Err(error) if !error.is_cancelled() => errors.push(error.to_string()),
+            Err(_) => {}
+        }
+    }
+    bail!(
+        "could not connect to any pinned Sonara endpoint: {}",
+        errors.join("; ")
+    )
 }
 
 async fn respond_to_clock(

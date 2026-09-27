@@ -18,7 +18,7 @@ use std::{
     io::{Seek, Write},
     net::SocketAddr,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -39,6 +39,30 @@ struct DiscoveryAnnouncement<'a> {
     protocol: &'static str,
     name: String,
     invitation: &'a str,
+}
+
+struct InvitationState {
+    current: Invitation,
+    previous: Option<Invitation>,
+}
+
+impl InvitationState {
+    fn encoded(&self) -> String {
+        self.current.encode()
+    }
+
+    fn authorizes(&self, request: &PairRequest, now: u64) -> bool {
+        [
+            &self.current,
+            self.previous.as_ref().unwrap_or(&self.current),
+        ]
+        .into_iter()
+        .any(|invitation| {
+            request.invitation_id == invitation.id
+                && invitation.token_matches(&request.token)
+                && invitation.validate(now).is_ok()
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +123,7 @@ enum ClockControl {
         offset_seconds: f64,
         uncertainty_ms: f64,
         samples: usize,
+        start_host_time_ns: u64,
     },
     PlaybackReady,
 }
@@ -108,6 +133,7 @@ pub struct ReceiveReport {
     pub packets_received: u64,
     pub packets_lost: u64,
     pub invalid_packets: u64,
+    pub redundant_packets: u64,
     pub frames_written: u64,
     pub duration_seconds: f64,
     pub rms: f64,
@@ -128,7 +154,7 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-async fn advertise_invitation(encoded: String) -> Result<()> {
+async fn advertise_invitation(state: Arc<Mutex<InvitationState>>) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
         .await
         .context("binding LAN discovery socket")?;
@@ -139,11 +165,6 @@ async fn advertise_invitation(encoded: String) -> Result<()> {
         .ok()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "Sonara host".to_owned());
-    let announcement = serde_json::to_vec(&DiscoveryAnnouncement {
-        protocol: DISCOVERY_PROTOCOL,
-        name: host_name,
-        invitation: &encoded,
-    })?;
     let broadcast: SocketAddr = format!("255.255.255.255:{DISCOVERY_PORT}").parse()?;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -153,11 +174,23 @@ async fn advertise_invitation(encoded: String) -> Result<()> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                let encoded = state.lock().expect("invitation mutex poisoned").encoded();
+                let announcement = serde_json::to_vec(&DiscoveryAnnouncement {
+                    protocol: DISCOVERY_PROTOCOL,
+                    name: host_name.clone(),
+                    invitation: &encoded,
+                })?;
                 let _ = socket.send_to(&announcement, broadcast).await;
             }
             received = socket.recv_from(&mut probe) => {
                 let (length, peer) = received.context("receiving LAN discovery probe")?;
                 if probe[..length] == DISCOVERY_PROBE[..] {
+                    let encoded = state.lock().expect("invitation mutex poisoned").encoded();
+                    let announcement = serde_json::to_vec(&DiscoveryAnnouncement {
+                        protocol: DISCOVERY_PROTOCOL,
+                        name: host_name.clone(),
+                        invitation: &encoded,
+                    })?;
                     let _ = socket.send_to(&announcement, peer).await;
                 }
             }
@@ -178,8 +211,11 @@ fn make_server_config() -> Result<(quinn::ServerConfig, Vec<u8>, bool)> {
     tls.max_early_data_size = 0;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let transport = Arc::get_mut(&mut config.transport).context("exclusive transport config")?;
-    transport.datagram_receive_buffer_size(Some(64 * 1024));
-    transport.datagram_send_buffer_size(64 * 1024);
+    transport.datagram_receive_buffer_size(Some(512 * 1024));
+    // A receiver may pause its radio briefly while Android switches power or
+    // scheduling states. Keep enough queued media for that transient without
+    // evicting the delayed-redundancy copy.
+    transport.datagram_send_buffer_size(512 * 1024);
     Ok((config, cert_bytes, identity.persistent))
 }
 
@@ -198,7 +234,7 @@ fn make_client_config(cert_der: &[u8]) -> Result<quinn::ClientConfig> {
 
 pub async fn host_test_tone(
     listen: SocketAddr,
-    advertise: Option<SocketAddr>,
+    advertise: Vec<SocketAddr>,
     duration: Duration,
     invitation_out: &Path,
     tuning: HostTuning,
@@ -218,7 +254,7 @@ pub async fn host_test_tone(
 pub async fn host_process(
     pid: u32,
     listen: SocketAddr,
-    advertise: Option<SocketAddr>,
+    advertise: Vec<SocketAddr>,
     duration: Duration,
     invitation_out: &Path,
     tuning: HostTuning,
@@ -236,7 +272,7 @@ pub async fn host_process(
 
 async fn host_audio(
     listen: SocketAddr,
-    advertise: Option<SocketAddr>,
+    advertise: Vec<SocketAddr>,
     duration: Duration,
     invitation_out: &Path,
     source: HostSource,
@@ -245,14 +281,26 @@ async fn host_audio(
     let (config, cert_der, persistent_identity) = make_server_config()?;
     let endpoint = quinn::Endpoint::server(config, listen)?;
     let local_addr = endpoint.local_addr()?;
-    let invitation_addr = advertise.unwrap_or(local_addr);
-    if invitation_addr.ip().is_unspecified() {
-        bail!("a wildcard listener requires --advertise with an explicit eligible LAN address");
+    let mut invitation_addrs = if advertise.is_empty() {
+        vec![local_addr]
+    } else {
+        advertise
+    };
+    invitation_addrs.sort_unstable();
+    invitation_addrs.dedup();
+    if invitation_addrs
+        .iter()
+        .any(|address| address.ip().is_unspecified())
+    {
+        bail!("a wildcard listener requires --advertise with explicit eligible LAN addresses");
     }
+    let invitation_endpoints: Vec<String> =
+        invitation_addrs.iter().map(ToString::to_string).collect();
+    let identity_fingerprint = certificate_fingerprint(&cert_der);
     let invitation = Invitation::issue(
-        vec![invitation_addr.to_string()],
-        certificate_fingerprint(&cert_der),
-        cert_der,
+        invitation_endpoints.clone(),
+        identity_fingerprint.clone(),
+        cert_der.clone(),
         unix_now(),
     );
     let encoded = invitation.encode();
@@ -270,28 +318,158 @@ async fn host_audio(
         }
     );
 
+    let invitations = Arc::new(Mutex::new(InvitationState {
+        current: invitation,
+        previous: None,
+    }));
+    let discovery_invitations = invitations.clone();
     let discovery_task = tokio::spawn(async move {
-        if let Err(error) = advertise_invitation(encoded).await {
+        if let Err(error) = advertise_invitation(discovery_invitations).await {
             eprintln!("LAN discovery unavailable: {error:#}");
         }
     });
+    let rotation_invitations = invitations.clone();
+    let rotation_path = invitation_out.to_path_buf();
+    let rotation_task = tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(90)).await;
+            let invitation = Invitation::issue(
+                invitation_endpoints.clone(),
+                identity_fingerprint.clone(),
+                cert_der.clone(),
+                unix_now(),
+            );
+            let encoded = invitation.encode();
+            {
+                let mut state = rotation_invitations
+                    .lock()
+                    .expect("invitation mutex poisoned");
+                state.previous = Some(std::mem::replace(&mut state.current, invitation));
+            }
+            if let Err(error) = tokio::fs::write(&rotation_path, encoded).await {
+                eprintln!("Could not rotate invitation file: {error}");
+            }
+        }
+    });
 
-    let wait = Duration::from_secs(invitation.expires_at_unix.saturating_sub(unix_now()).max(1));
-    let incoming = timeout(wait, endpoint.accept())
-        .await
-        .context("invitation expired before a receiver connected")?
-        .ok_or_else(|| anyhow!("QUIC endpoint closed"))?;
-    let connection = incoming.await.context("QUIC handshake failed")?;
+    let host_clock = Arc::new(Instant::now());
+    let session_start = Arc::new(Mutex::new(None::<u64>));
+    let wait = duration;
+    let first_connection = timeout(wait, async {
+        loop {
+            let incoming = endpoint
+                .accept()
+                .await
+                .ok_or_else(|| anyhow!("QUIC endpoint closed"))?;
+            match incoming.await {
+                Ok(connection) => match prepare_receiver(
+                    connection,
+                    &invitations,
+                    tuning,
+                    host_clock.clone(),
+                    session_start.clone(),
+                )
+                .await
+                {
+                    Ok(connection) => break Ok::<_, anyhow::Error>(connection),
+                    Err(error) => eprintln!("Receiver rejected: {error:#}"),
+                },
+                Err(error) => eprintln!("QUIC handshake failed: {error}"),
+            }
+        }
+    })
+    .await
+    .context("invitation expired before a receiver connected")??;
+    let receivers = ReceiverSet::default();
+    receivers.add(first_connection);
+    let accept_endpoint = endpoint.clone();
+    let accept_invitation = invitations.clone();
+    let accept_receivers = receivers.clone();
+    let accept_host_clock = host_clock.clone();
+    let accept_session_start = session_start.clone();
+    let accept_task = tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            match incoming.await {
+                Ok(connection) => {
+                    match prepare_receiver(
+                        connection,
+                        &accept_invitation,
+                        tuning,
+                        accept_host_clock.clone(),
+                        accept_session_start.clone(),
+                    )
+                    .await
+                    {
+                        Ok(connection) => {
+                            accept_receivers.add(connection);
+                            eprintln!(
+                                "Receiver joined; {} listeners active",
+                                accept_receivers.len()
+                            );
+                        }
+                        Err(error) => eprintln!("Receiver rejected: {error:#}"),
+                    }
+                }
+                Err(error) => eprintln!("QUIC handshake failed: {error}"),
+            }
+        }
+    });
+    let start_host_time_ns = (*session_start.lock().expect("session start mutex poisoned"))
+        .context("first receiver did not schedule a stream start")?;
+    let remaining_ns = start_host_time_ns.saturating_sub(host_clock.elapsed().as_nanos() as u64);
+    if remaining_ns > 0 {
+        sleep(Duration::from_nanos(remaining_ns)).await;
+    }
+    let frame_count = tuning.frame_count;
+    let source_name = match source {
+        HostSource::Tone => "generated 440 Hz tone".to_owned(),
+        #[cfg(windows)]
+        HostSource::Process(pid) => format!("WASAPI process tree {pid}"),
+    };
+    eprintln!(
+        "Streaming {source_name} as PCM16 in {frame_count}-frame packets with a {:.1} ms {} / {} target",
+        f64::from(tuning.target_buffer_frames) * 1000.0 / f64::from(LOGICAL_SAMPLE_RATE),
+        tuning.mode,
+        tuning.profile,
+    );
+
+    let (sent, expired) = match source {
+        HostSource::Tone => stream_tone(receivers.clone(), frame_count, duration).await?,
+        #[cfg(windows)]
+        HostSource::Process(pid) => {
+            stream_process(receivers.clone(), frame_count, pid, duration).await?
+        }
+    };
+    eprintln!(
+        "Stream complete: {sent} packets sent, {expired} expired under backpressure across {} receivers",
+        receivers.len()
+    );
+    sleep(Duration::from_millis(100)).await;
+    accept_task.abort();
     discovery_task.abort();
+    rotation_task.abort();
+    receivers.close_all();
+    let _ = timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+    Ok(())
+}
+
+async fn prepare_receiver(
+    connection: quinn::Connection,
+    invitations: &Arc<Mutex<InvitationState>>,
+    tuning: HostTuning,
+    host_clock: Arc<Instant>,
+    session_start: Arc<Mutex<Option<u64>>>,
+) -> Result<quinn::Connection> {
     let (mut send, mut recv) = timeout(Duration::from_secs(10), connection.accept_bi())
         .await
         .context("receiver did not authorize in time")??;
     let request: PairRequest = read_control(&mut recv)
         .await
         .context("reading pair request")?;
-    let authorized = request.invitation_id == invitation.id
-        && invitation.token_matches(&request.token)
-        && invitation.validate(unix_now()).is_ok();
+    let authorized = invitations
+        .lock()
+        .expect("invitation mutex poisoned")
+        .authorizes(&request, unix_now());
     if !authorized {
         let response = PairResponse {
             accepted: false,
@@ -316,20 +494,19 @@ async fn host_audio(
         .max_datagram_size()
         .context("peer does not support QUIC datagrams")?;
     let preferred_packet_size = HEADER_LEN + usize::from(tuning.frame_count) * 4;
-    let frame_count = if maximum >= preferred_packet_size {
-        tuning.frame_count
-    } else if maximum >= HEADER_LEN + 120 * 4 {
-        120
-    } else {
+    if maximum < preferred_packet_size {
         connection.close(2u32.into(), b"datagram size too small");
-        bail!("negotiated datagram limit {maximum} is below the 512-byte minimum");
-    };
+        bail!(
+            "negotiated datagram limit {maximum} is below required packet size {preferred_packet_size}"
+        );
+    }
+
     let response = PairResponse {
         accepted: true,
         message: format!("authorized {}", request.receiver_name),
         sample_rate: LOGICAL_SAMPLE_RATE,
         channels: CHANNELS,
-        frame_count,
+        frame_count: tuning.frame_count,
         epoch: 1,
         clock_probes: tuning.clock_probes,
         target_buffer_frames: tuning.target_buffer_frames,
@@ -339,7 +516,6 @@ async fn host_audio(
     };
     write_control(&mut send, &response).await?;
 
-    let host_clock = Instant::now();
     let mut estimator = ClockEstimator::default();
     for probe_id in 0..u64::from(response.clock_probes) {
         let t1_ns = host_clock.elapsed().as_nanos() as u64;
@@ -369,6 +545,12 @@ async fn host_audio(
     let clock = estimator
         .model()
         .context("clock estimator received no valid exchanges")?;
+    let start_host_time_ns = {
+        let mut start = session_start.lock().expect("session start mutex poisoned");
+        *start.get_or_insert_with(|| {
+            (host_clock.elapsed() + Duration::from_secs(2)).as_nanos() as u64
+        })
+    };
     write_control(
         &mut send,
         &ClockControl::Ready {
@@ -376,6 +558,7 @@ async fn host_audio(
             offset_seconds: clock.offset_seconds,
             uncertainty_ms: clock.uncertainty_seconds * 1000.0,
             samples: clock.samples,
+            start_host_time_ns,
         },
     )
     .await?;
@@ -385,43 +568,64 @@ async fn host_audio(
     if !matches!(playback_ready, ClockControl::PlaybackReady) {
         bail!("receiver sent an unexpected playback readiness message");
     }
-    let clock_task = tokio::spawn(continue_host_clock(
+    tokio::spawn(continue_host_clock(
         send,
         recv,
         host_clock,
         estimator,
         u64::from(response.clock_probes),
     ));
-    let source_name = match source {
-        HostSource::Tone => "generated 440 Hz tone".to_owned(),
-        #[cfg(windows)]
-        HostSource::Process(pid) => format!("WASAPI process tree {pid}"),
-    };
     eprintln!(
-        "Receiver authorized; clock samples={}, uncertainty={:.3} ms; streaming {source_name} as PCM16 in {frame_count}-frame packets with a {:.1} ms {} / {} target",
+        "Receiver authorized; clock samples={}, uncertainty={:.3} ms",
         clock.samples,
         clock.uncertainty_seconds * 1000.0,
-        f64::from(tuning.target_buffer_frames) * 1000.0 / f64::from(LOGICAL_SAMPLE_RATE),
-        tuning.mode,
-        tuning.profile,
     );
-
-    let (sent, expired) = match source {
-        HostSource::Tone => stream_tone(&connection, frame_count, duration).await?,
-        #[cfg(windows)]
-        HostSource::Process(pid) => stream_process(&connection, frame_count, pid, duration).await?,
-    };
-    eprintln!("Stream complete: {sent} packets sent, {expired} expired under backpressure");
-    // Let Quinn drain its bounded media queue before announcing completion.
-    sleep(Duration::from_millis(100)).await;
-    clock_task.abort();
-    connection.close(0u32.into(), b"stream complete");
-    let _ = timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
-    Ok(())
+    Ok(connection)
 }
 
-struct MediaSender<'a> {
-    connection: &'a quinn::Connection,
+#[derive(Clone, Default)]
+struct ReceiverSet(Arc<Mutex<Vec<quinn::Connection>>>);
+
+impl ReceiverSet {
+    fn add(&self, connection: quinn::Connection) {
+        self.0
+            .lock()
+            .expect("receiver set mutex poisoned")
+            .push(connection);
+    }
+
+    fn len(&self) -> usize {
+        self.0.lock().expect("receiver set mutex poisoned").len()
+    }
+
+    fn send_packet(&self, encoded: Bytes) -> u64 {
+        let mut expired = 0u64;
+        self.0
+            .lock()
+            .expect("receiver set mutex poisoned")
+            .retain(|connection| {
+                if connection.datagram_send_buffer_space() < encoded.len() {
+                    expired += 1;
+                }
+                connection.send_datagram(encoded.clone()).is_ok()
+            });
+        expired
+    }
+
+    fn close_all(&self) {
+        for connection in self
+            .0
+            .lock()
+            .expect("receiver set mutex poisoned")
+            .drain(..)
+        {
+            connection.close(0u32.into(), b"stream complete");
+        }
+    }
+}
+
+struct MediaSender {
+    receivers: ReceiverSet,
     frame_count: u16,
     started: Instant,
     sequence: u32,
@@ -430,10 +634,10 @@ struct MediaSender<'a> {
     expired: u64,
 }
 
-impl<'a> MediaSender<'a> {
-    fn new(connection: &'a quinn::Connection, frame_count: u16) -> Self {
+impl MediaSender {
+    fn new(receivers: ReceiverSet, frame_count: u16) -> Self {
         Self {
-            connection,
+            receivers,
             frame_count,
             started: Instant::now(),
             sequence: 0,
@@ -456,15 +660,8 @@ impl<'a> MediaSender<'a> {
                 .unwrap_or_else(|| self.started.elapsed().as_nanos() as u64),
             payload,
         };
-        let encoded = packet.encode()?;
-        if self.connection.datagram_send_buffer_space() < encoded.len() {
-            // Quinn evicts the oldest queued datagram. Count it so diagnostics
-            // expose local backpressure rather than hiding growing latency.
-            self.expired += 1;
-        }
-        self.connection
-            .send_datagram(Bytes::from(encoded))
-            .context("sending audio datagram")?;
+        let encoded = Bytes::from(packet.encode()?);
+        self.expired += self.receivers.send_packet(encoded);
         self.sent += 1;
         self.sequence = self.sequence.wrapping_add(1);
         self.first_frame += u64::from(self.frame_count);
@@ -499,7 +696,7 @@ impl<'a> MediaSender<'a> {
 }
 
 async fn stream_tone(
-    connection: &quinn::Connection,
+    receivers: ReceiverSet,
     frame_count: u16,
     duration: Duration,
 ) -> Result<(u64, u64)> {
@@ -508,7 +705,7 @@ async fn stream_tone(
     // Catch-up bursts create a large queue followed by starvation on remote
     // renderers. Delay the cadence after a late wake-up to preserve spacing.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut media = MediaSender::new(connection, frame_count);
+    let mut media = MediaSender::new(receivers, frame_count);
     let mut phase = 0f32;
     let phase_step = 440.0 * TAU / LOGICAL_SAMPLE_RATE as f32;
     let total_packets = (duration.as_secs_f64() / packet_period.as_secs_f64()).ceil() as u64;
@@ -528,7 +725,7 @@ async fn stream_tone(
 
 #[cfg(windows)]
 async fn stream_process(
-    connection: &quinn::Connection,
+    receivers: ReceiverSet,
     frame_count: u16,
     pid: u32,
     duration: Duration,
@@ -539,7 +736,7 @@ async fn stream_process(
     });
     let packet_bytes = frame_count as usize * usize::from(CHANNELS) * 2;
     let mut pending = VecDeque::with_capacity(packet_bytes * 3);
-    let mut media = MediaSender::new(connection, frame_count);
+    let mut media = MediaSender::new(receivers, frame_count);
     let mut capture_expired = 0u64;
     let mut first_qpc = None;
     let mut next_source_time_ns = 0u64;
@@ -599,18 +796,9 @@ async fn stream_process(
 }
 
 pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveReport> {
-    let endpoint_addr: SocketAddr = invitation
-        .endpoints
-        .first()
-        .context("missing endpoint")?
-        .parse()
-        .context("invitation endpoint is not a socket address")?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(make_client_config(&invitation.host_certificate_der)?);
-    let connection = endpoint
-        .connect(endpoint_addr, "sonara.local")?
-        .await
-        .context("connecting to pinned Sonara host")?;
+    let connection = connect_to_any_endpoint(&endpoint, &invitation.endpoints).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let request = PairRequest {
         invitation_id: invitation.id,
@@ -650,6 +838,7 @@ pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveRep
         offset_seconds,
         uncertainty_ms,
         samples: clock_samples,
+        start_host_time_ns: _,
     } = clock
     else {
         bail!("host did not finish clock synchronization");
@@ -669,6 +858,7 @@ pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveRep
     let mut received = 0u64;
     let mut lost = 0u64;
     let mut invalid = 0u64;
+    let mut redundant = 0u64;
     let mut frames = 0u64;
     let mut expected_sequence: Option<u32> = None;
     let mut reorder = BTreeMap::<u32, AudioPacket>::new();
@@ -700,12 +890,11 @@ pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveRep
         if expected_sequence.is_none() {
             expected_sequence = Some(packet.sequence);
         }
-        if packet.sequence < expected_sequence.unwrap()
-            || reorder.insert(packet.sequence, packet).is_some()
-        {
-            invalid += 1;
+        if packet.sequence < expected_sequence.unwrap() || reorder.contains_key(&packet.sequence) {
+            redundant += 1;
             continue;
         }
+        reorder.insert(packet.sequence, packet);
         received += 1;
         while let Some(packet) = reorder.remove(&expected_sequence.unwrap()) {
             observe_source_timestamp(
@@ -757,6 +946,7 @@ pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveRep
         packets_received: received,
         packets_lost: lost,
         invalid_packets: invalid,
+        redundant_packets: redundant,
         frames_written: frames,
         duration_seconds: started.elapsed().as_secs_f64(),
         rms: if sample_count == 0 {
@@ -775,6 +965,45 @@ pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveRep
     })
 }
 
+async fn connect_to_any_endpoint(
+    endpoint: &quinn::Endpoint,
+    encoded_addresses: &[String],
+) -> Result<quinn::Connection> {
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut parse_errors = Vec::new();
+    for encoded in encoded_addresses {
+        match encoded.parse::<SocketAddr>() {
+            Ok(address) => {
+                let endpoint = endpoint.clone();
+                attempts.spawn(async move {
+                    let connecting = endpoint.connect(address, "sonara.local")?;
+                    let connection = timeout(Duration::from_secs(8), connecting)
+                        .await
+                        .with_context(|| format!("connection to {address} timed out"))??;
+                    Ok::<_, anyhow::Error>((address, connection))
+                });
+            }
+            Err(error) => parse_errors.push(format!("{encoded}: {error}")),
+        }
+    }
+    let mut errors = parse_errors;
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok((_address, connection))) => {
+                attempts.abort_all();
+                return Ok(connection);
+            }
+            Ok(Err(error)) => errors.push(format!("{error:#}")),
+            Err(error) if !error.is_cancelled() => errors.push(error.to_string()),
+            Err(_) => {}
+        }
+    }
+    bail!(
+        "could not connect to any pinned Sonara endpoint: {}",
+        errors.join("; ")
+    )
+}
+
 fn observe_source_timestamp(
     value: u64,
     first: &mut Option<u64>,
@@ -791,7 +1020,7 @@ fn observe_source_timestamp(
 async fn continue_host_clock(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    host_clock: Instant,
+    host_clock: Arc<Instant>,
     mut estimator: ClockEstimator,
     mut probe_id: u64,
 ) {

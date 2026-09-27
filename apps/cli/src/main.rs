@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod acoustic;
 mod identity;
 mod network;
 #[cfg(windows)]
@@ -44,9 +45,9 @@ enum Command {
         test_tone: bool,
         #[arg(long, default_value = "127.0.0.1:49812")]
         listen: SocketAddr,
-        /// Address placed in the invitation for a wildcard listener.
-        #[arg(long)]
-        advertise: Option<SocketAddr>,
+        /// Address placed in the invitation. Repeat for every reachable host interface.
+        #[arg(long, action = clap::ArgAction::Append)]
+        advertise: Vec<SocketAddr>,
         #[arg(long, default_value_t = 5.0)]
         duration: f64,
         #[arg(long, default_value = "sonara-invitation.txt")]
@@ -105,6 +106,17 @@ enum DevCommand {
         #[arg(long, default_value = "captured.wav")]
         output: PathBuf,
     },
+    /// Measure acoustic offset between two channels of a shared-clock WAV recording.
+    MeasureSync {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        reference_channel: u16,
+        #[arg(long, default_value_t = 1)]
+        target_channel: u16,
+        #[arg(long, default_value_t = 250)]
+        max_offset_ms: u32,
+    },
 }
 #[derive(Subcommand)]
 enum DiagnosticsCommand {
@@ -144,7 +156,8 @@ fn host_tuning(mode: &Mode, profile: &Profile) -> network::HostTuning {
         Profile::Balanced => network::HostTuning {
             frame_count: 240,
             target_buffer_frames: if low_delay { 960 } else { 1_440 },
-            max_reorder_packets: if low_delay { 3 } else { 4 },
+            // Conceal a missing 5 ms frame before the playout ring drains.
+            max_reorder_packets: 2,
             clock_probes: 12,
             clock_probe_interval: Duration::from_millis(10),
             mode: if low_delay {
@@ -157,7 +170,7 @@ fn host_tuning(mode: &Mode, profile: &Profile) -> network::HostTuning {
         Profile::Stable => network::HostTuning {
             frame_count: 240,
             target_buffer_frames: if low_delay { 2_400 } else { 3_840 },
-            max_reorder_packets: 8,
+            max_reorder_packets: 4,
             clock_probes: 20,
             clock_probe_interval: Duration::from_millis(20),
             mode: if low_delay {
@@ -326,6 +339,19 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(windows))]
             bail!("process-loopback capture is available on Windows only");
+        }
+        Command::Dev {
+            command:
+                DevCommand::MeasureSync {
+                    input,
+                    reference_channel,
+                    target_channel,
+                    max_offset_ms,
+                },
+        } => {
+            let report =
+                acoustic::measure(&input, reference_channel, target_channel, max_offset_ms)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Diagnostics {
             command: DiagnosticsCommand::Export { output },

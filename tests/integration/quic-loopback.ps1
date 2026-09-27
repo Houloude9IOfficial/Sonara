@@ -58,7 +58,7 @@ try {
     $invite2 = Join-Path $testDir 'invitation-2.txt'
     $wav2 = Join-Path $testDir 'received-2.wav'
     $hostProcess = Start-Process -FilePath $exe `
-        -ArgumentList @('host', '--test-tone', '--listen', '127.0.0.1:0', '--duration', '0.1', '--invitation-out', $invite2) `
+        -ArgumentList @('host', '--test-tone', '--listen', '127.0.0.1:0', '--duration', '1', '--invitation-out', $invite2) `
         -WorkingDirectory $repo -RedirectStandardOutput (Join-Path $testDir 'host-2.out') `
         -RedirectStandardError (Join-Path $testDir 'host-2.err') -WindowStyle Hidden -PassThru
     for ($i = 0; $i -lt 100 -and -not (Test-Path -LiteralPath $invite2); $i++) { Start-Sleep -Milliseconds 100 }
@@ -72,7 +72,7 @@ try {
     if (-not $hostProcess.HasExited -or $hostProcess.ExitCode -ne 0) { throw 'second host failed' }
     $secondFingerprint = Get-InvitationFingerprint (Get-Content -LiteralPath $invite2 -Raw)
     if ($firstFingerprint -ne $secondFingerprint) { throw 'persistent host fingerprint changed between runs' }
-    if ($json2.packets_received -ne 20 -or $json2.frames_written -ne 4800) { throw 'second identity-reload stream was incomplete' }
+    if ($json2.packets_received -ne 200 -or $json2.frames_written -ne 48000) { throw 'second identity-reload stream was incomplete' }
 
     Write-Output "QUIC loopback passed: 400 PCM packets, 96000 frames, zero loss, $($json.clock_samples) clock samples"
     Write-Output "DPAPI identity reload passed: fingerprint $firstFingerprint"

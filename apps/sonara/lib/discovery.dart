@@ -13,12 +13,16 @@ class DiscoveredHost {
     required this.address,
     required this.invitation,
     required this.lastSeen,
+    required this.hostFingerprint,
+    required this.invitationId,
   });
 
   final String name;
   final String address;
   final String invitation;
   final DateTime lastSeen;
+  final String hostFingerprint;
+  final String invitationId;
 
   static DiscoveredHost? tryParse(Uint8List bytes, InternetAddress sender) {
     try {
@@ -37,11 +41,23 @@ class DiscoveredHost {
       final name = rawName is String && rawName.trim().isNotEmpty
           ? rawName.trim()
           : 'Sonara host';
+      final invitationJson = jsonDecode(
+        utf8.decode(
+          base64Url.decode(base64Url.normalize(invitation.substring(8))),
+        ),
+      );
+      if (invitationJson is! Map ||
+          invitationJson['host_fingerprint'] is! String ||
+          invitationJson['id'] is! String) {
+        return null;
+      }
       return DiscoveredHost(
         name: name,
         address: sender.address,
         invitation: invitation,
         lastSeen: DateTime.now(),
+        hostFingerprint: invitationJson['host_fingerprint'] as String,
+        invitationId: invitationJson['id'] as String,
       );
     } on FormatException {
       return null;

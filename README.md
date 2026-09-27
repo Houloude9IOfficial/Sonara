@@ -40,6 +40,14 @@ Low Delay + Balanced is the default measured profile. It starts with a 20 ms sof
 
 The CLI also exposes `devices` and `sources`. `host --test-tone`, `host --pid`, and `receive` exercise the real QUIC datagram path. Low-latency pairing performs 12 initial clock exchanges at 100 Hz and continues probing at 2 Hz while streaming. The process path requests 48 kHz PCM16 stereo directly from WASAPI, carries capture QPC timestamps into packet source time, joins Windows' Pro Audio scheduling class, and uses a bounded 16-block capture ring that expires old audio instead of accumulating latency. Packets split from a WASAPI block are paced on absolute media deadlines instead of being emitted as a burst. Windows requests 1 ms timer resolution and test-tone pacing delays after missed ticks rather than sending catch-up bursts.
 
+To measure real speaker-to-speaker skew, record both outputs as separate channels using one shared-clock recorder, then run:
+
+```powershell
+cargo run -p sonara -- dev measure-sync --input .\two-speakers.wav --reference-channel 0 --target-channel 1
+```
+
+The JSON result reports signed offset, normalized correlation, peak-to-sidelobe ratio, and a conservative confidence label. Clock synchronization alone is never presented as proof of acoustic alignment.
+
 For a local capture-only diagnostic, run `cargo run -p sonara -- dev capture --pid 1234 --duration 5 --output captured.wav`. Silence is reported as an observation, not proof that an application forbids capture.
 
 On Windows, the host certificate is stable across runs and its private key is encrypted for the current user with DPAPI under `%LOCALAPPDATA%\Sonara\identity`. Set `SONARA_IDENTITY_DIR` only for isolated development or test identities.
@@ -67,5 +75,15 @@ Pop-Location
 ```
 
 Android builds require Rust targets `aarch64-linux-android` and `x86_64-linux-android`, plus `cargo-ndk`. Gradle invokes the Rust build automatically and packages both ABIs.
+
+## Package releases
+
+Run the end-to-end packager from the repository root:
+
+```powershell
+.\tools\packaging\build-release.ps1 -Platform All
+```
+
+It builds the Windows release bundle, portable ZIP, unsigned per-user installer, and a developer-signed Android release APK under `dist`. On its first Android run it creates a dedicated local release key and credentials under `apps/sonara/android`; both are ignored by Git. Back them up securely—losing the key prevents in-place updates to installed APKs. SHA-256 sidecar files are generated for every distributable.
 
 See [PLAN.md](PLAN.md) and [architecture status](docs/architecture/README.md). Licensed under MIT.

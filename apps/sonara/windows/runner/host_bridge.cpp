@@ -136,7 +136,7 @@ bool IsPrivateIpv4(const std::string& address) {
          (first == 192 && second == 168);
 }
 
-std::string SelectLanAddress() {
+std::vector<std::string> SelectLanAddresses() {
   ULONG size = 0;
   if (GetAdaptersInfo(nullptr, &size) != ERROR_BUFFER_OVERFLOW || size == 0) {
     return {};
@@ -147,8 +147,8 @@ std::string SelectLanAddress() {
     return {};
   }
 
-  std::string fallback;
-  std::string private_fallback;
+  std::vector<std::string> preferred;
+  std::vector<std::string> fallback;
   for (auto* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
     if (adapter->Type == MIB_IF_TYPE_LOOPBACK) {
       continue;
@@ -162,18 +162,20 @@ std::string SelectLanAddress() {
       if (IsPrivateIpv4(text)) {
         const std::string gateway = adapter->GatewayList.IpAddress.String;
         if (!gateway.empty() && gateway != "0.0.0.0") {
-          return text;
+          preferred.push_back(text);
+        } else {
+          fallback.push_back(text);
         }
-        if (private_fallback.empty()) {
-          private_fallback = text;
-        }
-      }
-      if (fallback.empty()) {
-        fallback = text;
+      } else {
+        fallback.push_back(text);
       }
     }
   }
-  return private_fallback.empty() ? fallback : private_fallback;
+  preferred.insert(preferred.end(), fallback.begin(), fallback.end());
+  std::sort(preferred.begin(), preferred.end());
+  preferred.erase(std::unique(preferred.begin(), preferred.end()),
+                  preferred.end());
+  return preferred;
 }
 
 std::wstring Quote(const std::wstring& value) {
@@ -363,8 +365,8 @@ void HostBridge::HandleMethodCall(
     return;
   }
 
-  address_ = SelectLanAddress();
-  if (address_.empty()) {
+  const std::vector<std::string> addresses = SelectLanAddresses();
+  if (addresses.empty()) {
     result->Error("network", "No active LAN IPv4 address was found");
     return;
   }
@@ -379,14 +381,17 @@ void HostBridge::HandleMethodCall(
     result->Error("engine", "The bundled Sonara audio engine is missing");
     return;
   }
-  const std::wstring address =
-      std::wstring(address_.begin(), address_.end()) + L":49812";
+  address_ = addresses.front();
   const std::wstring mode_w(mode->begin(), mode->end());
   const std::wstring profile_w(profile->begin(), profile->end());
   std::wstringstream command;
   command << Quote(engine) << L" host --pid " << *pid
-          << L" --listen 0.0.0.0:49812 --advertise " << address
-          << L" --duration 86400 --invitation-out "
+          << L" --listen 0.0.0.0:49812";
+  for (const std::string& candidate : addresses) {
+    command << L" --advertise "
+            << std::wstring(candidate.begin(), candidate.end()) << L":49812";
+  }
+  command << L" --duration 86400 --invitation-out "
           << Quote(invitation_path_) << L" --mode " << mode_w
           << L" --profile " << profile_w;
   std::wstring mutable_command = command.str();

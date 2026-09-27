@@ -24,6 +24,8 @@ void main() {
       await tester.pumpWidget(const SonaraApp());
       expect(find.text('Scanning for hosts…'), findsOneWidget);
       expect(find.text('Scanning the local network…'), findsOneWidget);
+      expect(find.text('Audio source'), findsNothing);
+      expect(find.text('LISTENING'), findsNothing);
       expect(find.textContaining('Galaxy'), findsNothing);
       expect(find.textContaining('Samsung'), findsNothing);
 
