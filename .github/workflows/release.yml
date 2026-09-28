@@ -38,11 +38,16 @@ jobs:
         run: ./tools/packaging/build-release.ps1 -Platform Windows
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-production
+          name: Sonara-Windows-Setup-EXE
           if-no-files-found: error
           path: |
             dist/Sonara-*-windows-x64-setup.exe
             dist/Sonara-*-windows-x64-setup.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sonara-Windows-Portable-ZIP
+          if-no-files-found: error
+          path: |
             dist/Sonara-*-windows-x64-portable.zip
             dist/Sonara-*-windows-x64-portable.zip.sha256
 
@@ -101,7 +106,7 @@ jobs:
         run: ./tools/packaging/build-release.ps1 -Platform Android
       - uses: actions/upload-artifact@v4
         with:
-          name: android-production
+          name: Sonara-Android-Installer-APK
           if-no-files-found: error
           path: |
             dist/Sonara-*-android.apk
@@ -140,20 +145,23 @@ jobs:
           mkdir -p ../../dist
           app_path="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
           test -n "$app_path"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$app_path" \
-            "../../dist/Sonara-${version}-macos-universal.zip"
+          hdiutil create \
+            -volname Sonara \
+            -srcfolder "$app_path" \
+            -ov \
+            -format UDZO \
+            "../../dist/Sonara-${version}-macos.dmg"
           cd ../../dist
-          shasum -a 256 "Sonara-${version}-macos-universal.zip" > \
-            "Sonara-${version}-macos-universal.zip.sha256"
+          shasum -a 256 "Sonara-${version}-macos.dmg" > \
+            "Sonara-${version}-macos.dmg.sha256"
       - uses: actions/upload-artifact@v4
         if: steps.project.outputs.available == 'true'
         with:
-          name: macos-production
+          name: Sonara-macOS-Installer-DMG
           if-no-files-found: error
           path: |
-            dist/Sonara-*-macos-universal.zip
-            dist/Sonara-*-macos-universal.zip.sha256
+            dist/Sonara-*-macos.dmg
+            dist/Sonara-*-macos.dmg.sha256
 
   publish:
     name: Attach production builds to release

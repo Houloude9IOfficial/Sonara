@@ -557,24 +557,24 @@ Current production release targets include:
 
 ## Windows
 
-- Installer
-- Portable ZIP
-- SHA-256 checksum files
+- Setup installer `.exe` (uploaded as its own release asset)
+- Portable `.zip`
+- A SHA-256 checksum alongside each file
 
 ## Android
 
-- Signed APK
+- Signed installer `.apk` (uploaded as its own release asset)
 - SHA-256 checksum
 
 ## macOS
 
-The macOS release lane is expected to activate after the Flutter macOS application exists at:
+The macOS lane will build a compressed disk image (`.dmg`) and its SHA-256 checksum after the Flutter macOS application exists at:
 
 ```text
 apps/sonara/macos
 ```
 
-macOS signing and notarization requirements should be documented separately when that target becomes production-ready.
+The `.dmg` will be uploaded as its own release asset. Apple signing and notarization requirements should be addressed before distributing a production macOS build broadly.
 
 ---
 
