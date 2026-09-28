@@ -1,123 +1,99 @@
 # Sonara
 
-Sonara is a local-first Windows and Android audio synchronization project. It has no account, cloud relay, telemetry, or implicit recording.
+Sonara sends audio from a Windows PC to nearby Android devices so they can play it at nearly the same time. It is designed for devices on the same local network. The project is open source under the MIT License.
 
-This repository contains an executable POC: a standalone Windows host, portable Rust logic, a developer CLI, direct Windows WASAPI process-tree capture, authenticated QUIC/PCM streaming, deterministic timing simulation, protocol definitions, and a Flutter app with an Android foreground receiver backed by Rust/JNI and Oboe. The Windows app discovers live applications and LAN interfaces dynamically, owns the native host process, and continues in the notification area when its window is closed.
+Network and device timing vary, and low software buffer settings do not guarantee a particular speaker-to-speaker delay. See [Known limitations](#known-limitations) before relying on it for precise synchronization.
 
-## Run
+## What Sonara does
 
-### Windows desktop app
+- Captures audio from a selected Windows application or from all system audio.
+- Lets Android devices find a running Sonara PC on the local network and connect to it.
+- Streams audio over a direct, authenticated connection. The PC does not send audio through a Sonara cloud service.
+- Synchronizes device clocks and schedules playback using audio timestamps.
+- Keeps Android playback active when the screen is off, using Android's media playback controls and foreground playback service.
+- Shows connected receivers on the PC and the selected output route and connection state on Android.
+- Offers adjustable buffer profiles to balance responsiveness and recovery from network jitter.
 
-Build the complete desktop bundle once, then launch the window by double-clicking `sonara.exe` (or with the final command below):
+Sonara does not require an account. It does not record microphone input, store or upload streamed audio, or send telemetry.
+
+## How a session works
+
+1. Start a Sonara session on the Windows PC and choose **System audio** or a running application.
+2. Sonara advertises the host on the local network. Nearby Android devices listen for these announcements and can also probe the network to find a host.
+3. Select the PC on Android. The devices establish an authenticated connection using a short-lived invitation and the host's identity.
+4. The PC streams timestamped audio. Android uses clock measurements and its current system media output route to schedule playback.
+5. Stop the receiver on Android or stop the session on Windows to end playback and streaming.
+
+Automatic discovery generally requires both devices to be on the same Wi-Fi, Ethernet, or tethered local network, with local-network traffic allowed. If discovery is unavailable, Android can connect using a copied invitation. Do not share an invitation with anyone you do not intend to connect.
+
+## Use the Windows and Android apps
+
+### Windows
+
+Use the portable package from a GitHub release, or build the app as described below. Keep `sonara.exe`, `sonara_engine.exe`, the `data` directory, and the accompanying runtime files together. Start `sonara.exe`, select **System audio** or an application, and choose **Start session**. Sonara chooses an active local-network address automatically.
+
+Closing the app window minimizes Sonara to the notification area while a session is active. Open the tray icon to restore the window, or use its menu to exit.
+
+### Android
+
+Install the signed APK from a GitHub release, then open **Session** or **Devices** and choose a nearby Sonara PC. Android may ask to allow notifications or to install apps from the browser or file manager you used. Keep the PC and phone on the same local network for discovery and streaming.
+
+Playback follows Android's current media output route. To change between the phone speaker, headphones, or another supported route, use Android's media output panel.
+
+## Build from source
+
+### Prerequisites
+
+- Git
+- Flutter stable and its Windows and Android build dependencies
+- Rust stable and Cargo
+- For Android: Android SDK/NDK, Rust targets `aarch64-linux-android` and `x86_64-linux-android`, and `cargo-ndk`
+
+Fetch Flutter packages and build the app:
 
 ```powershell
-cd apps\sonara
+Push-Location apps\sonara
+flutter pub get
+flutter run -d windows
+# Or create a Windows release build:
 flutter build windows --release
-.\build\windows\x64\runner\Release\sonara.exe
+# Or create an Android debug APK:
+flutter build apk --debug
+Pop-Location
 ```
 
-Choose **System audio** to send everything audible on the PC, or choose any running application from the dynamic source list, then click **Start session**. Android listeners on the same Wi-Fi, Ethernet, or tethered LAN discover the PC automatically and connect with one tap; copy/paste remains only as a fallback. The desktop app selects an active LAN address itself—there is no PID or `YOUR_PC_IP` placeholder to replace. Closing the window hides it to the notification area while the host remains active; double-click the Sonara tray icon to restore it, or right-click it and choose **Exit**. The release directory is the portable app: keep its DLL, `data` folder, and internal `sonara_engine.exe` beside `sonara.exe`.
+Production packaging, Android signing, GitHub release automation, and optional Play Store distribution are documented separately in [apps/build.md](apps/build.md) for project maintainers.
 
-### Developer CLI
+## Development and tests
 
-```powershell
-$env:PATH = "C:\Users\USER\.cargo\bin;$env:PATH"
-cargo run -p sonara -- dev simulate --scenario tests/scenarios/good-lan.toml
-cargo run -p sonara -- diagnostics export --output run.json
-# Terminal 1: writes a certificate-pinned, two-minute invitation
-cargo run -p sonara -- host --test-tone --listen 127.0.0.1:49812 --duration 5
-# Or capture one running Windows process tree in real time
-cargo run -p sonara -- host --pid 1234 --listen 127.0.0.1:49812 --duration 5
-# Terminal 2: saves authenticated PCM packets as a WAV file
-cargo run -p sonara -- receive --invitation-file sonara-invitation.txt --output received.wav
-```
-
-For another LAN device, listen on `0.0.0.0:49812` and pass the explicitly selected eligible interface as `--advertise 192.168.1.10:49812`. Sonara does not guess or silently select a cellular route.
-
-On Android, open **Session** or **Devices** and select the PC under **Nearby Sonara hosts**. The listener sends an active LAN probe and also receives one-second host beacons; stale sessions disappear after six seconds. Receiving is owned by a media-playback foreground service and continues with the screen off. Device name, ABI, selected output route, native sample rate, channel count, frames per burst, buffer occupancy, and timing metrics are discovered at runtime; no phone model is selected in product code. An emulator reaches the same protocol and Oboe callback path, but it is not evidence of physical acoustic timing.
-
-Low Delay + Balanced is the default measured profile. It starts with a 20 ms software render queue and can adapt up to 60 ms when the network or platform genuinely underruns. Ultra Low adapts from 10–30 ms and Stable from 50–150 ms in Low Delay mode (up to 240 ms in Synchronized mode). A recovery pauses consumption once, refills at a slightly larger target, and resumes; after ten stable seconds the target steps back down. Stale audio remains bounded instead of allowing delay to grow indefinitely. These are software queue targets, not guaranteed capture-to-speaker latency; Android hardware, Wi-Fi scheduling, and the selected output route add time. Sonara also cannot delay an unmanaged PC speaker, so exact acoustic synchronization with audio still playing directly on the PC requires a future Sonara-controlled local output path.
-
-The CLI also exposes `devices` and `sources`. `host --system-audio`, `host --test-tone`, `host --pid`, and `receive` exercise the real QUIC datagram path. Low-latency pairing performs 12 initial clock exchanges at 100 Hz and continues probing at 2 Hz while streaming. The process and system paths request 48 kHz PCM16 stereo directly from WASAPI, carry capture QPC timestamps into packet source time, join Windows' Pro Audio scheduling class, and use a bounded 16-block capture ring that expires old audio instead of accumulating latency. Packets split from a WASAPI block are paced on absolute media deadlines instead of being emitted as a burst. Windows requests 1 ms timer resolution and test-tone pacing delays after missed ticks rather than sending catch-up bursts.
-
-To measure real speaker-to-speaker skew, record both outputs as separate channels using one shared-clock recorder, then run:
-
-```powershell
-cargo run -p sonara -- dev measure-sync --input .\two-speakers.wav --reference-channel 0 --target-channel 1
-```
-
-The JSON result reports signed offset, normalized correlation, peak-to-sidelobe ratio, and a conservative confidence label. Clock synchronization alone is never presented as proof of acoustic alignment.
-
-For a local capture-only diagnostic, run `cargo run -p sonara -- dev capture --pid 1234 --duration 5 --output captured.wav`. Silence is reported as an observation, not proof that an application forbids capture.
-
-On Windows, the host certificate is stable across runs and its private key is encrypted for the current user with DPAPI under `%LOCALAPPDATA%\Sonara\identity`. Set `SONARA_IDENTITY_DIR` only for isolated development or test identities.
-
-## Verify
+Run the checks from the repository root:
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-pwsh -File tests/integration/quic-loopback.ps1
-# Windows machine with an active audio service:
-pwsh -File tests/integration/windows-process-loopback.ps1
-# With any booted Android device/emulator (auto-discovered emulator by default):
-pwsh -File tests/integration/android-emulator-loopback.ps1
-# Add -ScreenOff only when explicitly testing background playback.
-# Extended lifecycle/soak invocation:
-pwsh -File tests/integration/android-emulator-loopback.ps1 -NoBuild -DurationSeconds 1800
-Push-Location apps/sonara
+Push-Location apps\sonara
 flutter analyze
 flutter test
-flutter build windows --debug
-flutter build apk --debug
 Pop-Location
 ```
 
-Android builds require Rust targets `aarch64-linux-android` and `x86_64-linux-android`, plus `cargo-ndk`. Gradle invokes the Rust build automatically and packages both ABIs.
+The `tests/integration/` directory contains scripts for local streaming, Windows audio capture, and Android receiver checks. Some checks require a Windows audio session or a connected Android device/emulator. Emulator success does not measure real speaker-to-speaker timing.
 
-## Package releases
+## Known limitations
 
-Run the persistent interactive builder from the repository root:
+- Sonara is in active development. Wi-Fi contention, Android device scheduling, and audio hardware can add delay or cause buffering.
+- Buffer profiles control Sonara's software queue. They do not promise a specific end-to-end or acoustic latency.
+- Windows capture can send selected process audio or system output, but Sonara cannot currently delay unmanaged PC speaker playback to guarantee acoustic alignment with the receiving phone.
+- Android uses the platform's current output route; Sonara does not select or control every device-specific audio route.
+- Discovery depends on local-network permissions and router behavior. Guest Wi-Fi, client isolation, VPNs, firewalls, or hotspot settings may block it. Manual invitation entry is available as a fallback.
+- Timing measurements and network synchronization are not the same as measuring sound waves from physical speakers. A shared-clock recording is needed to measure acoustic skew.
+- macOS support is not available yet.
 
-```powershell
-python .\build.py
-```
+## Contributing
 
-Choose Android, Windows, or All, followed by Production or Debug. Android and
-Windows use separately labelled live output channels, and the builder prints
-the resulting `.apk` and `.exe` paths before returning to its menu. macOS is the
-next planned platform slot.
+Bug reports and focused pull requests are welcome. Include the Windows and Android versions, connection method, selected output route, and privacy-scrubbed diagnostics when relevant. Do not include invitations, private keys, keystores, passwords, or recordings containing private audio.
 
-Run the end-to-end packager from the repository root:
+## License
 
-```powershell
-.\tools\packaging\build-release.ps1 -Platform All
-```
-
-It builds the Windows release bundle, portable ZIP, unsigned per-user installer, and a developer-signed Android release APK under `dist`. On its first Android run it creates a dedicated local release key and credentials under `apps/sonara/android`; both are ignored by Git. Back them up securely—losing the key prevents in-place updates to installed APKs. SHA-256 sidecar files are generated for every distributable.
-
-### GitHub releases
-
-Publishing a GitHub Release runs `.github/workflows/release.yml`. Windows and
-Android production packages are built on their native CI lanes and attached to
-that release with SHA-256 sidecars. The macOS lane is already present and
-activates automatically after the Flutter macOS project is added. A manual run
-can update an existing release by supplying its tag; matching assets are
-replaced.
-
-Configure these Actions secrets before publishing a release so every Android
-version uses the same signing identity:
-
-- `SONARA_ANDROID_KEYSTORE_BASE64` — base64-encoded `release-key.jks`
-- `SONARA_ANDROID_STORE_PASSWORD`
-- `SONARA_ANDROID_KEY_ALIAS`
-- `SONARA_ANDROID_KEY_PASSWORD`
-
-For PowerShell, create the first value without changing the keystore:
-
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes('apps/sonara/android/release-key.jks'))
-```
-
-See [PLAN.md](PLAN.md) and [architecture status](docs/architecture/README.md). Licensed under MIT.
+Sonara is distributed under the [MIT License](LICENSE).

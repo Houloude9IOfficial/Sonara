@@ -71,12 +71,19 @@ jobs:
           STORE_PASSWORD: ${{ secrets.SONARA_ANDROID_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.SONARA_ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.SONARA_ANDROID_KEY_PASSWORD }}
+          REGISTERED_CERT_SHA256: ${{ vars.SONARA_ANDROID_REGISTERED_CERT_SHA256 }}
         run: |
-          if [[ -z "$KEYSTORE_BASE64" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+          if [[ -z "$KEYSTORE_BASE64" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" || -z "$REGISTERED_CERT_SHA256" ]]; then
             echo 'Android release-signing secrets are not configured.' >&2
             exit 1
           fi
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > release-key.jks
+          actual_fingerprint="$(keytool -list -v -keystore release-key.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -1 | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          expected_fingerprint="$(printf '%s' "$REGISTERED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          if [[ -z "$actual_fingerprint" || "$actual_fingerprint" != "$expected_fingerprint" ]]; then
+            echo 'The CI signing certificate does not match SONARA_ANDROID_REGISTERED_CERT_SHA256.' >&2
+            exit 1
+          fi
           {
             echo 'storeFile=release-key.jks'
             echo "storePassword=$STORE_PASSWORD"
