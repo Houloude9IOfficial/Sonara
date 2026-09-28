@@ -21,6 +21,7 @@ use windows::{
             AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
             IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
             IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
             PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
         },
@@ -33,7 +34,7 @@ use windows::{
             },
             Threading::{
                 AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
-                WaitForSingleObject,
+                GetCurrentProcessId, WaitForSingleObject,
             },
             Variant::VT_BLOB,
         },
@@ -132,7 +133,7 @@ pub fn capture_process_stream(
     duration: Duration,
     sender: tokio::sync::broadcast::Sender<CaptureBlock>,
 ) -> Result<(u64, u64)> {
-    capture_process_with(pid, duration, |block| {
+    capture_with(pid, false, duration, |block| {
         // A broadcast ring is deliberately bounded: if the network consumer
         // falls behind, the oldest capture blocks expire instead of growing
         // latency without limit.
@@ -140,8 +141,29 @@ pub fn capture_process_stream(
     })
 }
 
+pub fn capture_system_stream(
+    duration: Duration,
+    sender: tokio::sync::broadcast::Sender<CaptureBlock>,
+) -> Result<(u64, u64)> {
+    let pid = unsafe { GetCurrentProcessId() };
+    capture_with(pid, true, duration, |block| {
+        // Excluding this process tree prevents Sonara from recapturing its own
+        // internal host audio while retaining every other audible process.
+        let _ = sender.send(block);
+    })
+}
+
 fn capture_process_with(
     pid: u32,
+    duration: Duration,
+    consume: impl FnMut(CaptureBlock),
+) -> Result<(u64, u64)> {
+    capture_with(pid, false, duration, consume)
+}
+
+fn capture_with(
+    pid: u32,
+    exclude_process_tree: bool,
     duration: Duration,
     mut consume: impl FnMut(CaptureBlock),
 ) -> Result<(u64, u64)> {
@@ -154,8 +176,12 @@ fn capture_process_with(
     let mmcss = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) }
         .context("joining the Windows Pro Audio scheduling class")?;
     let _mmcss = MmcssGuard(mmcss);
-    eprintln!("WASAPI: activating process loopback for PID {pid}");
-    let audio_client = activate_process_client(pid)?;
+    if exclude_process_tree {
+        eprintln!("WASAPI: activating system loopback (excluding Sonara PID {pid})");
+    } else {
+        eprintln!("WASAPI: activating process loopback for PID {pid}");
+    }
+    let audio_client = activate_process_client(pid, exclude_process_tree)?;
     eprintln!("WASAPI: activation complete");
     let format = pcm_format();
     unsafe {
@@ -291,13 +317,17 @@ pub fn capture_process_to_wav(
     })
 }
 
-fn activate_process_client(pid: u32) -> Result<IAudioClient> {
+fn activate_process_client(pid: u32, exclude_process_tree: bool) -> Result<IAudioClient> {
     let mut activation = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                 TargetProcessId: pid,
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                ProcessLoopbackMode: if exclude_process_tree {
+                    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+                } else {
+                    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+                },
             },
         },
     };

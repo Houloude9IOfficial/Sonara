@@ -246,6 +246,7 @@ pub extern "system" fn Java_dev_sonara_sonara_SonaraService_nativeStart(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     invitation: JString<'_>,
+    receiver_name: JString<'_>,
 ) -> jboolean {
     if RUNNING.swap(true, Ordering::AcqRel) {
         return JNI_FALSE;
@@ -255,6 +256,14 @@ pub extern "system" fn Java_dev_sonara_sonara_SonaraService_nativeStart(
         Err(error) => {
             RUNNING.store(false, Ordering::Release);
             set_error(format!("invalid invitation text: {error}"));
+            return JNI_FALSE;
+        }
+    };
+    let receiver_name: String = match env.get_string(&receiver_name) {
+        Ok(value) => value.into(),
+        Err(error) => {
+            RUNNING.store(false, Ordering::Release);
+            set_error(format!("invalid receiver name: {error}"));
             return JNI_FALSE;
         }
     };
@@ -269,7 +278,9 @@ pub extern "system" fn Java_dev_sonara_sonara_SonaraService_nativeStart(
             .enable_all()
             .build()
             .context("creating Android receiver runtime")
-            .and_then(|runtime| runtime.block_on(run_receiver(encoded.trim())));
+            .and_then(|runtime| {
+                runtime.block_on(run_receiver(encoded.trim(), receiver_name.trim()))
+            });
         if let Err(error) = result {
             set_error(format!("{error:#}"));
         } else {
@@ -300,7 +311,7 @@ pub extern "system" fn Java_dev_sonara_sonara_SonaraService_nativeStatus(
         .unwrap_or(std::ptr::null_mut())
 }
 
-async fn run_receiver(encoded: &str) -> Result<()> {
+async fn run_receiver(encoded: &str, receiver_name: &str) -> Result<()> {
     let invitation = Invitation::decode(encoded, unix_now()).context("decoding invitation")?;
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(
@@ -321,7 +332,11 @@ async fn run_receiver(encoded: &str) -> Result<()> {
         &PairRequest {
             invitation_id: invitation.id,
             token: invitation.pairing_token().to_vec(),
-            receiver_name: "sonara-android".into(),
+            receiver_name: if receiver_name.is_empty() {
+                "Android device".into()
+            } else {
+                receiver_name.chars().take(120).collect()
+            },
         },
     )
     .await?;

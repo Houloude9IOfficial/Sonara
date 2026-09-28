@@ -70,6 +70,8 @@ enum HostSource {
     Tone,
     #[cfg(windows)]
     Process(u32),
+    #[cfg(windows)]
+    System,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -185,6 +187,8 @@ async fn advertise_invitation(state: Arc<Mutex<InvitationState>>) -> Result<()> 
             received = socket.recv_from(&mut probe) => {
                 let (length, peer) = received.context("receiving LAN discovery probe")?;
                 if probe[..length] == DISCOVERY_PROBE[..] {
+                    #[cfg(debug_assertions)]
+                    eprintln!("Discovery probe from {peer}");
                     let encoded = state.lock().expect("invitation mutex poisoned").encoded();
                     let announcement = serde_json::to_vec(&DiscoveryAnnouncement {
                         protocol: DISCOVERY_PROTOCOL,
@@ -265,6 +269,25 @@ pub async fn host_process(
         duration,
         invitation_out,
         HostSource::Process(pid),
+        tuning,
+    )
+    .await
+}
+
+#[cfg(windows)]
+pub async fn host_system(
+    listen: SocketAddr,
+    advertise: Vec<SocketAddr>,
+    duration: Duration,
+    invitation_out: &Path,
+    tuning: HostTuning,
+) -> Result<()> {
+    host_audio(
+        listen,
+        advertise,
+        duration,
+        invitation_out,
+        HostSource::System,
         tuning,
     )
     .await
@@ -425,6 +448,8 @@ async fn host_audio(
         HostSource::Tone => "generated 440 Hz tone".to_owned(),
         #[cfg(windows)]
         HostSource::Process(pid) => format!("WASAPI process tree {pid}"),
+        #[cfg(windows)]
+        HostSource::System => "WASAPI system audio".to_owned(),
     };
     eprintln!(
         "Streaming {source_name} as PCM16 in {frame_count}-frame packets with a {:.1} ms {} / {} target",
@@ -437,8 +462,10 @@ async fn host_audio(
         HostSource::Tone => stream_tone(receivers.clone(), frame_count, duration).await?,
         #[cfg(windows)]
         HostSource::Process(pid) => {
-            stream_process(receivers.clone(), frame_count, pid, duration).await?
+            stream_wasapi(receivers.clone(), frame_count, Some(pid), duration).await?
         }
+        #[cfg(windows)]
+        HostSource::System => stream_wasapi(receivers.clone(), frame_count, None, duration).await?,
     };
     eprintln!(
         "Stream complete: {sent} packets sent, {expired} expired under backpressure across {} receivers",
@@ -459,7 +486,7 @@ async fn prepare_receiver(
     tuning: HostTuning,
     host_clock: Arc<Instant>,
     session_start: Arc<Mutex<Option<u64>>>,
-) -> Result<quinn::Connection> {
+) -> Result<PreparedReceiver> {
     let (mut send, mut recv) = timeout(Duration::from_secs(10), connection.accept_bi())
         .await
         .context("receiver did not authorize in time")??;
@@ -580,18 +607,33 @@ async fn prepare_receiver(
         clock.samples,
         clock.uncertainty_seconds * 1000.0,
     );
-    Ok(connection)
+    Ok(PreparedReceiver {
+        connection,
+        name: sanitized_receiver_name(&request.receiver_name),
+    })
+}
+
+struct PreparedReceiver {
+    connection: quinn::Connection,
+    name: String,
+}
+
+struct ReceiverConnection {
+    connection: quinn::Connection,
+    name: String,
 }
 
 #[derive(Clone, Default)]
-struct ReceiverSet(Arc<Mutex<Vec<quinn::Connection>>>);
+struct ReceiverSet(Arc<Mutex<Vec<ReceiverConnection>>>);
 
 impl ReceiverSet {
-    fn add(&self, connection: quinn::Connection) {
-        self.0
-            .lock()
-            .expect("receiver set mutex poisoned")
-            .push(connection);
+    fn add(&self, receiver: PreparedReceiver) {
+        let mut receivers = self.0.lock().expect("receiver set mutex poisoned");
+        receivers.push(ReceiverConnection {
+            connection: receiver.connection,
+            name: receiver.name,
+        });
+        report_receiver_roster(&receivers);
     }
 
     fn len(&self) -> usize {
@@ -600,27 +642,56 @@ impl ReceiverSet {
 
     fn send_packet(&self, encoded: Bytes) -> u64 {
         let mut expired = 0u64;
-        self.0
-            .lock()
-            .expect("receiver set mutex poisoned")
-            .retain(|connection| {
-                if connection.datagram_send_buffer_space() < encoded.len() {
-                    expired += 1;
-                }
-                connection.send_datagram(encoded.clone()).is_ok()
-            });
+        let mut receivers = self.0.lock().expect("receiver set mutex poisoned");
+        let previous_len = receivers.len();
+        receivers.retain(|receiver| {
+            if receiver.connection.datagram_send_buffer_space() < encoded.len() {
+                expired += 1;
+            }
+            receiver.connection.send_datagram(encoded.clone()).is_ok()
+        });
+        if receivers.len() != previous_len {
+            report_receiver_roster(&receivers);
+        }
         expired
     }
 
     fn close_all(&self) {
-        for connection in self
+        for receiver in self
             .0
             .lock()
             .expect("receiver set mutex poisoned")
             .drain(..)
         {
-            connection.close(0u32.into(), b"stream complete");
+            receiver.connection.close(0u32.into(), b"stream complete");
         }
+        eprintln!("SONARA_RECEIVERS");
+    }
+}
+
+fn sanitized_receiver_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\r' | '\n'))
+        .take(120)
+        .collect::<String>();
+    if sanitized.trim().is_empty() {
+        "Android device".into()
+    } else {
+        sanitized
+    }
+}
+
+fn report_receiver_roster(receivers: &[ReceiverConnection]) {
+    let names = receivers
+        .iter()
+        .map(|receiver| receiver.name.as_str())
+        .collect::<Vec<_>>()
+        .join("\t");
+    if names.is_empty() {
+        eprintln!("SONARA_RECEIVERS");
+    } else {
+        eprintln!("SONARA_RECEIVERS\t{names}");
     }
 }
 
@@ -724,15 +795,16 @@ async fn stream_tone(
 }
 
 #[cfg(windows)]
-async fn stream_process(
+async fn stream_wasapi(
     receivers: ReceiverSet,
     frame_count: u16,
-    pid: u32,
+    pid: Option<u32>,
     duration: Duration,
 ) -> Result<(u64, u64)> {
     let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
-    let capture = tokio::task::spawn_blocking(move || {
-        crate::windows_capture::capture_process_stream(pid, duration, sender)
+    let capture = tokio::task::spawn_blocking(move || match pid {
+        Some(pid) => crate::windows_capture::capture_process_stream(pid, duration, sender),
+        None => crate::windows_capture::capture_system_stream(duration, sender),
     });
     let packet_bytes = frame_count as usize * usize::from(CHANNELS) * 2;
     let mut pending = VecDeque::with_capacity(packet_bytes * 3);

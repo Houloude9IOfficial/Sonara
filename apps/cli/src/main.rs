@@ -38,11 +38,14 @@ enum Command {
         command: PairCommand,
     },
     Host {
-        #[arg(long, required_unless_present = "test_tone")]
+        #[arg(long, conflicts_with_all = ["test_tone", "system_audio"])]
         pid: Option<u32>,
         /// Stream a generated 440 Hz tone through the real QUIC/PCM path.
         #[arg(long, conflicts_with = "pid")]
         test_tone: bool,
+        /// Capture all audible Windows applications, excluding Sonara itself.
+        #[arg(long, conflicts_with_all = ["pid", "test_tone"])]
+        system_audio: bool,
         #[arg(long, default_value = "127.0.0.1:49812")]
         listen: SocketAddr,
         /// Address placed in the invitation. Repeat for every reachable host interface.
@@ -247,6 +250,7 @@ async fn main() -> Result<()> {
         Command::Host {
             pid,
             test_tone,
+            system_audio,
             listen,
             advertise,
             duration,
@@ -259,6 +263,11 @@ async fn main() -> Result<()> {
             }
             eprintln!("mode={mode:?}, profile={profile:?}");
             let tuning = host_tuning(&mode, &profile);
+            let source_count =
+                usize::from(pid.is_some()) + usize::from(test_tone) + usize::from(system_audio);
+            if source_count != 1 {
+                bail!("choose exactly one source: --pid, --system-audio, or --test-tone");
+            }
             if test_tone {
                 network::host_test_tone(
                     listen,
@@ -268,6 +277,18 @@ async fn main() -> Result<()> {
                     tuning,
                 )
                 .await?;
+            } else if system_audio {
+                #[cfg(windows)]
+                network::host_system(
+                    listen,
+                    advertise,
+                    Duration::from_secs_f64(duration),
+                    &invitation_out,
+                    tuning,
+                )
+                .await?;
+                #[cfg(not(windows))]
+                bail!("system audio hosting is available on Windows only");
             } else {
                 let pid = pid.expect("clap requires PID when test tone is disabled");
                 if !process_exists(pid) {

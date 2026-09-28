@@ -7,6 +7,15 @@ const sonaraDiscoveryPort = 49813;
 const sonaraDiscoveryProtocol = 'sonara-discovery/1';
 const sonaraDiscoveryProbe = 'SONARA_DISCOVER/1';
 
+class NativeDiscoveryDatagram {
+  const NativeDiscoveryDatagram({required this.data, required this.address});
+
+  final Uint8List data;
+  final InternetAddress address;
+}
+
+typedef NativeDiscoveryScan = Future<List<NativeDiscoveryDatagram>> Function();
+
 class DiscoveredHost {
   const DiscoveredHost({
     required this.name,
@@ -68,16 +77,35 @@ class DiscoveredHost {
 }
 
 class SonaraDiscovery {
+  SonaraDiscovery({Iterable<InternetAddress>? probeAddresses, this.nativeScan})
+    : _probeAddresses = List.unmodifiable(
+        probeAddresses ?? [InternetAddress('255.255.255.255')],
+      );
+
   final _updates = StreamController<List<DiscoveredHost>>.broadcast();
   final Map<String, DiscoveredHost> _hosts = {};
+  final List<InternetAddress> _probeAddresses;
+  final NativeDiscoveryScan? nativeScan;
   RawDatagramSocket? _socket;
   StreamSubscription<RawSocketEvent>? _subscription;
   Timer? _timer;
+  int _probeCursor = 0;
+  bool _started = false;
+  bool _nativeScanInFlight = false;
 
   Stream<List<DiscoveredHost>> get updates => _updates.stream;
 
   Future<void> start() async {
-    if (_socket != null) return;
+    if (_started) return;
+    _started = true;
+    if (nativeScan != null) {
+      scan();
+      _timer = Timer.periodic(const Duration(seconds: 2), (_) {
+        _expireHosts();
+        scan();
+      });
+      return;
+    }
     final socket = await RawDatagramSocket.bind(
       InternetAddress.anyIPv4,
       sonaraDiscoveryPort,
@@ -98,21 +126,56 @@ class SonaraDiscovery {
     }, onError: _updates.addError);
     scan();
     _timer = Timer.periodic(const Duration(seconds: 2), (_) {
-      final cutoff = DateTime.now().subtract(const Duration(seconds: 6));
-      _hosts.removeWhere((_, host) => host.lastSeen.isBefore(cutoff));
-      _emit();
+      _expireHosts();
       scan();
     });
   }
 
   void scan() {
+    if (nativeScan != null) {
+      unawaited(_scanNative());
+      return;
+    }
     final socket = _socket;
     if (socket == null) return;
-    socket.send(
-      utf8.encode(sonaraDiscoveryProbe),
-      InternetAddress('255.255.255.255'),
-      sonaraDiscoveryPort,
-    );
+    final probe = utf8.encode(sonaraDiscoveryProbe);
+    const batchSize = 128;
+    final count = _probeAddresses.length < batchSize
+        ? _probeAddresses.length
+        : batchSize;
+    for (var offset = 0; offset < count; offset++) {
+      final address =
+          _probeAddresses[(_probeCursor + offset) % _probeAddresses.length];
+      socket.send(probe, address, sonaraDiscoveryPort);
+    }
+    if (_probeAddresses.isNotEmpty) {
+      _probeCursor = (_probeCursor + count) % _probeAddresses.length;
+    }
+  }
+
+  Future<void> _scanNative() async {
+    if (_nativeScanInFlight || !_started) return;
+    final scanProvider = nativeScan;
+    if (scanProvider == null) return;
+    _nativeScanInFlight = true;
+    try {
+      final datagrams = await scanProvider();
+      for (final datagram in datagrams) {
+        final host = DiscoveredHost.tryParse(datagram.data, datagram.address);
+        if (host != null) _hosts[host.invitation] = host;
+      }
+      _emit();
+    } catch (error) {
+      if (!_updates.isClosed) _updates.addError(error);
+    } finally {
+      _nativeScanInFlight = false;
+    }
+  }
+
+  void _expireHosts() {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 6));
+    _hosts.removeWhere((_, host) => host.lastSeen.isBefore(cutoff));
+    _emit();
   }
 
   void _emit() {
@@ -122,6 +185,7 @@ class SonaraDiscovery {
   }
 
   Future<void> stop() async {
+    _started = false;
     _timer?.cancel();
     await _subscription?.cancel();
     _socket?.close();

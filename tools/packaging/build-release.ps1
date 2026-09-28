@@ -35,6 +35,21 @@ function Write-Hash([string]$Path) {
 
 if ($Platform -in @('All', 'Windows')) {
     if (-not $SkipBuild) {
+        $brandingScript = Join-Path $root 'tools\branding\round_desktop_icons.py'
+        $checkedInIcon = Join-Path $app 'windows\runner\resources\app_icon.ico'
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        $hasPillow = $false
+        if ($python) {
+            & $python.Source -c 'import PIL' 2>$null
+            $hasPillow = $LASTEXITCODE -eq 0
+        }
+        if ($hasPillow) {
+            Invoke-Checked $python.Source @($brandingScript) $root
+        } elseif (-not (Test-Path $checkedInIcon)) {
+            throw 'Pillow is unavailable and the checked-in Windows icon is missing.'
+        } else {
+            Write-Warning 'Pillow is unavailable; using the checked-in generated Windows icon.'
+        }
         Invoke-Checked 'flutter' @('build', 'windows', '--release') $app
     }
     $built = Join-Path $app 'build\windows\x64\runner\Release'

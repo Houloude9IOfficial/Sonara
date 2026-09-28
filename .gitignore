@@ -16,3 +16,4 @@ apps/sonara/android/key.properties
 apps/sonara/android/release-key.jks
 /.tmp-manual-lowlat
 /*.tmp-*/
+*.tmp*

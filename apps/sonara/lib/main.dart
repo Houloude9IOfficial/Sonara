@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform;
+import 'dart:io'
+    show InternetAddress, InternetAddressType, Platform, SocketException;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -8,7 +9,10 @@ import 'package:flutter/services.dart';
 
 import 'discovery.dart';
 
-void main() => runApp(const SonaraApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const SonaraApp());
+}
 
 const ink = Color(0xFF17202A),
     indigo = Color(0xFF4057C8),
@@ -23,6 +27,26 @@ class SonaraApp extends StatelessWidget {
     themeMode: ThemeMode.system,
     theme: theme(Brightness.light),
     darkTheme: theme(Brightness.dark),
+    builder: (context, child) {
+      final theme = Theme.of(context);
+      final dark = theme.brightness == Brightness.dark;
+      return AnnotatedRegion<SystemUiOverlayStyle>(
+        value: (dark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
+            .copyWith(
+              statusBarColor: theme.scaffoldBackgroundColor,
+              systemNavigationBarColor: theme.colorScheme.surface,
+              systemNavigationBarDividerColor: Colors.transparent,
+              systemNavigationBarIconBrightness: dark
+                  ? Brightness.light
+                  : Brightness.dark,
+              statusBarIconBrightness: dark
+                  ? Brightness.light
+                  : Brightness.dark,
+              systemNavigationBarContrastEnforced: false,
+            ),
+        child: child ?? const SizedBox.shrink(),
+      );
+    },
     home: const SonaraShell(),
   );
 }
@@ -38,17 +62,39 @@ ThemeData theme(Brightness brightness) {
     colorScheme: colors,
     scaffoldBackgroundColor: dark ? const Color(0xFF101217) : mist,
     fontFamily: 'Inter',
-    dividerColor: colors.outlineVariant.withValues(alpha: .6),
-    inputDecorationTheme: const InputDecorationTheme(
-      border: OutlineInputBorder(),
+    dividerColor: colors.outlineVariant.withValues(alpha: .35),
+    appBarTheme: AppBarTheme(
+      elevation: 0,
+      scrolledUnderElevation: 0,
+      centerTitle: false,
+      backgroundColor: dark ? const Color(0xFF101217) : mist,
+      foregroundColor: colors.onSurface,
+      surfaceTintColor: Colors.transparent,
+    ),
+    navigationBarTheme: NavigationBarThemeData(
+      elevation: 0,
+      backgroundColor: colors.surface,
+      indicatorColor: colors.primaryContainer,
+      surfaceTintColor: Colors.transparent,
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      filled: true,
+      fillColor: colors.surfaceContainerHighest.withValues(alpha: .45),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide.none,
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide.none,
+      ),
     ),
     cardTheme: CardThemeData(
       elevation: 0,
-      color: colors.surface,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
-        side: BorderSide(color: colors.outlineVariant),
-      ),
+      margin: EdgeInsets.zero,
+      color: colors.surfaceContainerLow,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     ),
   );
 }
@@ -69,6 +115,8 @@ class _SonaraShellState extends State<SonaraShell> {
   int page = 0;
   bool streaming = false;
   bool hostBusy = false;
+  bool receiverBusy = false;
+  bool statusRefreshInFlight = false;
   bool sourcesLoading = false;
   bool startWithWindows = false;
   int? selectedSourcePid;
@@ -85,6 +133,9 @@ class _SonaraShellState extends State<SonaraShell> {
   bool autoConnectInFlight = false;
   Set<String> trustedFingerprints = const {};
   String? lastAutoInvitationId;
+  String? connectedHostFingerprint;
+  String? connectedHostName;
+  String? manuallyDisconnectedFingerprint;
   Timer? statusTimer;
   ListeningMode mode = ListeningMode.lowDelay;
   BufferProfile profile = BufferProfile.balanced;
@@ -110,20 +161,20 @@ class _SonaraShellState extends State<SonaraShell> {
     super.initState();
     if (defaultTargetPlatform == TargetPlatform.android) {
       statusTimer = Timer.periodic(
-        const Duration(milliseconds: 500),
+        const Duration(milliseconds: 100),
         (_) => refreshReceiverStatus(),
       );
       refreshReceiverStatus();
       if (Platform.isAndroid) {
         refreshTrustState();
-        startDiscovery();
+        unawaited(startDiscovery());
       }
     } else if (defaultTargetPlatform == TargetPlatform.windows) {
       refreshSources();
       refreshHostStatus();
       refreshStartupSetting();
       statusTimer = Timer.periodic(
-        const Duration(seconds: 1),
+        const Duration(milliseconds: 100),
         (_) => refreshHostStatus(),
       );
     }
@@ -139,6 +190,8 @@ class _SonaraShellState extends State<SonaraShell> {
   }
 
   Future<void> refreshReceiverStatus() async {
+    if (statusRefreshInFlight) return;
+    statusRefreshInFlight = true;
     try {
       final raw = await receiverChannel.invokeMethod<String>('status');
       if (raw == null || !mounted) return;
@@ -150,7 +203,10 @@ class _SonaraShellState extends State<SonaraShell> {
         receiverStatus = parsed;
         receiverState = nextState;
         outputs.first
-          ..name = parsed['platform_model'] as String? ?? 'Current device'
+          ..name =
+              parsed['device_name'] as String? ??
+              parsed['platform_model'] as String? ??
+              'Current device'
           ..route = parsed['output_route'] as String? ?? 'Platform default'
           ..quality = receiverState == 'playing'
               ? 'Timestamp observed'
@@ -159,11 +215,45 @@ class _SonaraShellState extends State<SonaraShell> {
       if (becamePlaying) unawaited(refreshTrustState());
     } catch (_) {
       // The native receiver is Android-only; the desktop UI remains usable.
+    } finally {
+      statusRefreshInFlight = false;
     }
   }
 
   Future<void> startDiscovery() async {
-    final service = SonaraDiscovery();
+    if (receiverActive || receiverBusy) return;
+    if (discovery != null) {
+      discovery?.scan();
+      return;
+    }
+    List<InternetAddress>? probeAddresses;
+    try {
+      final preparation = await receiverChannel
+          .invokeMapMethod<String, dynamic>('ensureLocalNetworkAccess');
+      final rawAddresses = preparation?['probe_addresses'];
+      if (rawAddresses is List) {
+        final parsed = rawAddresses
+            .whereType<String>()
+            .map(InternetAddress.tryParse)
+            .whereType<InternetAddress>()
+            .where((address) => address.type == InternetAddressType.IPv4)
+            .toList();
+        if (parsed.isNotEmpty) probeAddresses = parsed;
+      }
+    } on PlatformException {
+      if (mounted) {
+        setState(() {
+          discoveryError = 'Sonara could not request local network access.';
+        });
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() => discoveryError = null);
+    final service = SonaraDiscovery(
+      probeAddresses: probeAddresses,
+      nativeScan: Platform.isAndroid ? scanAndroidNetwork : null,
+    );
     discovery = service;
     discoverySubscription = service.updates.listen(
       (hosts) {
@@ -176,7 +266,7 @@ class _SonaraShellState extends State<SonaraShell> {
       },
       onError: (Object error) {
         if (mounted) {
-          setState(() => discoveryError = 'LAN scan unavailable: $error');
+          setState(() => discoveryError = discoveryErrorMessage(error));
         }
       },
     );
@@ -184,9 +274,44 @@ class _SonaraShellState extends State<SonaraShell> {
       await service.start();
     } catch (error) {
       if (mounted) {
-        setState(() => discoveryError = 'LAN scan unavailable: $error');
+        setState(() => discoveryError = discoveryErrorMessage(error));
       }
     }
+  }
+
+  Future<List<NativeDiscoveryDatagram>> scanAndroidNetwork() async {
+    final raw = await receiverChannel.invokeListMethod<dynamic>(
+      'scanLocalNetwork',
+    );
+    if (raw == null) return const [];
+    final datagrams = <NativeDiscoveryDatagram>[];
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final data = entry['data'];
+      final address = InternetAddress.tryParse('${entry['address'] ?? ''}');
+      if (data is Uint8List && address != null) {
+        datagrams.add(NativeDiscoveryDatagram(data: data, address: address));
+      }
+    }
+    return datagrams;
+  }
+
+  Future<void> stopDiscovery() async {
+    final activeDiscovery = discovery;
+    discovery = null;
+    discoveredHosts = const [];
+    discoveryError = null;
+    await discoverySubscription?.cancel();
+    discoverySubscription = null;
+    if (activeDiscovery != null) await activeDiscovery.stop();
+    if (mounted) setState(() {});
+  }
+
+  String discoveryErrorMessage(Object error) {
+    if (error is SocketException && error.osError?.errorCode == 1) {
+      return 'Local network access is blocked. Allow Nearby devices for Sonara, then tap Scan again.';
+    }
+    return 'Could not scan this network. Check Wi-Fi and try again.';
   }
 
   String? validateInvitation(String? value) {
@@ -194,6 +319,14 @@ class _SonaraShellState extends State<SonaraShell> {
     if (invitation.isEmpty) return 'Enter an invitation first.';
     if (!invitation.startsWith('sonara1:')) {
       return 'This is not a Sonara invitation.';
+    }
+    final payload = _invitationPayload(invitation);
+    if (payload == null ||
+        payload['id'] is! String ||
+        payload['host_fingerprint'] is! String ||
+        payload['endpoints'] is! List ||
+        payload['token'] is! String) {
+      return 'This invitation is damaged or incomplete.';
     }
     return null;
   }
@@ -203,12 +336,14 @@ class _SonaraShellState extends State<SonaraShell> {
     bool trust = true,
     bool quiet = false,
   }) async {
+    if (receiverBusy) return;
     final invitation = value is String ? value.trim() : '';
     final validation = validateInvitation(invitation);
     if (validation != null) {
       if (!quiet) showError(validation);
       return;
     }
+    if (mounted) setState(() => receiverBusy = true);
     try {
       final started = await receiverChannel.invokeMethod<bool>('start', {
         'invitation': invitation,
@@ -218,12 +353,21 @@ class _SonaraShellState extends State<SonaraShell> {
         if (!quiet) showError('Android did not start the receiver.');
         return;
       }
+      connectedHostName = discoveredHosts
+          .where((host) => host.invitation == invitation)
+          .map((host) => host.name)
+          .firstOrNull;
+      connectedHostFingerprint = _invitationFingerprint(invitation);
+      await stopDiscovery();
+      if (!quiet) manuallyDisconnectedFingerprint = null;
       if (trust) await refreshTrustState();
       await refreshReceiverStatus();
     } on PlatformException catch (error) {
       if (!quiet) showError(error.message ?? 'Could not start receiver');
     } catch (error) {
       if (!quiet) showError('Could not start receiver: $error');
+    } finally {
+      if (mounted) setState(() => receiverBusy = false);
     }
   }
 
@@ -304,6 +448,11 @@ class _SonaraShellState extends State<SonaraShell> {
     if (!mounted || !autoReconnect || receiverActive || autoConnectInFlight) {
       return;
     }
+    final suppressed = manuallyDisconnectedFingerprint;
+    if (suppressed != null) {
+      if (hosts.any((host) => host.hostFingerprint == suppressed)) return;
+      manuallyDisconnectedFingerprint = null;
+    }
     DiscoveredHost? candidate;
     for (final host in hosts) {
       if (trustedFingerprints.contains(host.hostFingerprint) &&
@@ -323,49 +472,50 @@ class _SonaraShellState extends State<SonaraShell> {
   }
 
   Future<void> importInvitation() async {
-    final controller = TextEditingController();
-    final formKey = GlobalKey<FormState>();
     final invitation = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Connect this receiver'),
-        content: Form(
-          key: formKey,
-          child: TextFormField(
-            controller: controller,
-            autofocus: true,
-            minLines: 3,
-            maxLines: 6,
-            validator: validateInvitation,
-            decoration: const InputDecoration(
-              labelText: 'Sonara invitation',
-              hintText: 'sonara1:…',
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              if (formKey.currentState?.validate() == true) {
-                Navigator.pop(context, controller.text.trim());
-              }
-            },
-            child: const Text('Connect'),
-          ),
-        ],
-      ),
+      builder: (context) => InvitationDialog(validator: validateInvitation),
     );
-    controller.dispose();
-    if (invitation != null) await connectInvitation(invitation);
+    if (invitation != null && mounted) await connectInvitation(invitation);
   }
 
   Future<void> stopReceiver() async {
-    await receiverChannel.invokeMethod<bool>('stop');
-    await refreshReceiverStatus();
+    if (receiverBusy) return;
+    setState(() {
+      receiverBusy = true;
+      receiverState = 'stopping';
+      manuallyDisconnectedFingerprint = connectedHostFingerprint;
+      connectedHostFingerprint = null;
+      connectedHostName = null;
+    });
+    try {
+      final stopped = await receiverChannel.invokeMethod<bool>('stop');
+      if (stopped != true) showError('The receiver did not stop.');
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      await refreshReceiverStatus();
+    } on PlatformException catch (error) {
+      showError(error.message ?? 'Could not stop the receiver');
+    } finally {
+      if (mounted) setState(() => receiverBusy = false);
+      unawaited(startDiscovery());
+    }
+  }
+
+  String? _invitationFingerprint(String invitation) {
+    final fingerprint = _invitationPayload(invitation)?['host_fingerprint'];
+    return fingerprint is String && fingerprint.isNotEmpty ? fingerprint : null;
+  }
+
+  Map<String, dynamic>? _invitationPayload(String invitation) {
+    try {
+      final encoded = invitation.substring('sonara1:'.length);
+      final decoded = jsonDecode(
+        utf8.decode(base64Url.decode(base64Url.normalize(encoded))),
+      );
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } on Object {
+      return null;
+    }
   }
 
   Future<void> refreshSources() async {
@@ -393,6 +543,8 @@ class _SonaraShellState extends State<SonaraShell> {
   }
 
   Future<void> refreshHostStatus() async {
+    if (statusRefreshInFlight) return;
+    statusRefreshInFlight = true;
     try {
       final raw = await hostChannel.invokeMethod<Map<dynamic, dynamic>>(
         'status',
@@ -406,6 +558,8 @@ class _SonaraShellState extends State<SonaraShell> {
       });
     } catch (_) {
       // The native host is Windows-only.
+    } finally {
+      statusRefreshInFlight = false;
     }
   }
 
@@ -442,6 +596,11 @@ class _SonaraShellState extends State<SonaraShell> {
       final raw = await hostChannel
           .invokeMethod<Map<dynamic, dynamic>>('start', {
             'pid': selectedSourcePid,
+            'systemAudio': selectedSourcePid == 0,
+            'sourceLabel': sources
+                .where((source) => source.pid == selectedSourcePid)
+                .map((source) => source.name)
+                .firstOrNull,
             'mode': mode == ListeningMode.synchronized
                 ? 'synchronized'
                 : 'low-delay',
@@ -508,7 +667,13 @@ class _SonaraShellState extends State<SonaraShell> {
   Widget build(BuildContext context) {
     final wide = MediaQuery.sizeOf(context).width >= 760;
     return Scaffold(
-      // appBar: wide ? null : AppBar(title: const Wordmark()),
+      appBar: wide
+          ? null
+          : AppBar(
+              toolbarHeight: 44,
+              titleSpacing: 16,
+              title: const Wordmark(compact: true),
+            ),
       bottomNavigationBar: wide
           ? null
           : NavigationBar(
@@ -530,7 +695,12 @@ class _SonaraShellState extends State<SonaraShell> {
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 1050),
                   child: Padding(
-                    padding: const EdgeInsets.all(28),
+                    padding: EdgeInsets.fromLTRB(
+                      wide ? 32 : 16,
+                      wide ? 32 : 10,
+                      wide ? 32 : 16,
+                      24,
+                    ),
                     child: currentPage(),
                   ),
                 ),
@@ -554,6 +724,46 @@ class _SonaraShellState extends State<SonaraShell> {
       receiverState != 'stopped' &&
       receiverState != 'error';
 
+  bool get receiverConnected =>
+      receiverState == 'buffering' || receiverState == 'playing';
+
+  bool get discoveryScanning =>
+      defaultTargetPlatform == TargetPlatform.android &&
+      !receiverActive &&
+      !receiverBusy &&
+      discoveredHosts.isEmpty &&
+      discoveryError == null;
+
+  String get receiverDeviceName =>
+      receiverStatus['device_name'] as String? ?? outputs.first.name;
+
+  List<String> get connectedDevices {
+    final raw = hostStatus['connected_devices'];
+    if (raw is! List) return const [];
+    return raw.whereType<String>().where((name) => name.isNotEmpty).toList();
+  }
+
+  bool get canStartHost => selectedSourcePid != null && !hostBusy;
+
+  String get sessionActionHint {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      if (receiverBusy) return 'Applying receiver state…';
+      if (receiverActive) {
+        return 'Audio continues in the background until stopped.';
+      }
+      if (discoveredHosts.isEmpty) {
+        return 'Looking for Sonara PCs on this network.';
+      }
+      return 'Ready to connect securely.';
+    }
+    if (hostBusy) return 'Applying session state…';
+    if (streaming) return 'Active on the local network and safe to minimize.';
+    if (selectedSourcePid == null) {
+      return 'Select System audio or an application to continue.';
+    }
+    return 'Ready to open the session.';
+  }
+
   Widget nearbyHostsPanel() => Panel(
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -561,10 +771,10 @@ class _SonaraShellState extends State<SonaraShell> {
         Row(
           children: [
             const Expanded(child: Label('NEARBY SONARA HOSTS')),
-            TextButton.icon(
-              onPressed: () => discovery?.scan(),
-              icon: const Icon(Icons.radar),
-              label: const Text('Scan'),
+            IconButton.filledTonal(
+              tooltip: 'Scan again',
+              onPressed: () => unawaited(startDiscovery()),
+              icon: const Icon(Icons.refresh_rounded),
             ),
           ],
         ),
@@ -572,12 +782,21 @@ class _SonaraShellState extends State<SonaraShell> {
         if (discoveredHosts.isEmpty)
           ListTile(
             contentPadding: EdgeInsets.zero,
-            leading: const SizedBox(
+            leading: SizedBox(
               width: 24,
               height: 24,
-              child: CircularProgressIndicator(strokeWidth: 2),
+              child: discoveryError == null
+                  ? const CircularProgressIndicator(strokeWidth: 2)
+                  : Icon(
+                      Icons.wifi_off_rounded,
+                      color: Theme.of(context).colorScheme.error,
+                    ),
             ),
-            title: const Text('Scanning the local network…'),
+            title: Text(
+              discoveryError == null
+                  ? 'Scanning the local network…'
+                  : 'Local network scan paused',
+            ),
             subtitle: Text(
               discoveryError ??
                   'Keep Sonara open on the PC and use the same Wi-Fi, Ethernet, or tethered LAN.',
@@ -585,19 +804,12 @@ class _SonaraShellState extends State<SonaraShell> {
           )
         else
           for (final host in discoveredHosts)
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: const CircleAvatar(child: Icon(Icons.computer)),
-              title: Text(host.name),
-              subtitle: Text(
-                '${host.address} · ${trustedFingerprints.contains(host.hostFingerprint) ? 'trusted host' : 'encrypted session'}',
-              ),
-              trailing: FilledButton(
-                onPressed: receiverActive
-                    ? null
-                    : () => connectInvitation(host.invitation),
-                child: const Text('Connect'),
-              ),
+            NearbyHostTile(
+              host: host,
+              trusted: trustedFingerprints.contains(host.hostFingerprint),
+              enabled: !receiverActive && !receiverBusy,
+              busy: receiverBusy,
+              onConnect: () => connectInvitation(host.invitation),
             ),
         const Divider(),
         Align(
@@ -611,6 +823,201 @@ class _SonaraShellState extends State<SonaraShell> {
       ],
     ),
   );
+
+  Widget receiverConnectionPanel() => Panel(
+    child: Row(
+      children: [
+        CircleAvatar(
+          backgroundColor: receiverConnected
+              ? Colors.green.withValues(alpha: .14)
+              : Theme.of(context).colorScheme.secondaryContainer,
+          child: Icon(
+            receiverConnected ? Icons.link_rounded : Icons.sync_rounded,
+            color: receiverConnected
+                ? Colors.green.shade700
+                : Theme.of(context).colorScheme.onSecondaryContainer,
+          ),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                receiverConnected
+                    ? 'Connected to ${connectedHostName ?? 'Sonara PC'}'
+                    : 'Connecting to ${connectedHostName ?? 'Sonara PC'}…',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 3),
+              Text(
+                receiverConnected
+                    ? '$receiverDeviceName is receiving audio.'
+                    : 'Securing the connection and synchronizing audio.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+        StatusPill(
+          label: receiverConnected ? 'CONNECTED' : 'CONNECTING',
+          active: receiverConnected,
+        ),
+      ],
+    ),
+  );
+
+  Widget androidSessionStatePanel() {
+    final state = receiverConnected
+        ? 'connected'
+        : receiverActive
+        ? 'connecting'
+        : 'idle';
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+      alignment: Alignment.topCenter,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 280),
+        reverseDuration: const Duration(milliseconds: 220),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) => FadeTransition(
+          opacity: animation,
+          child: SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(0, .035),
+              end: Offset.zero,
+            ).animate(animation),
+            child: child,
+          ),
+        ),
+        child: KeyedSubtree(
+          key: ValueKey(state),
+          child: receiverActive
+              ? receiverConnectionPanel()
+              : nearbyHostsPanel(),
+        ),
+      ),
+    );
+  }
+
+  Widget sessionActionArea() {
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+      alignment: Alignment.topCenter,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 240),
+        child: discoveryScanning
+            ? const SizedBox.shrink(key: ValueKey('scanning-action-hidden'))
+            : Column(
+                key: const ValueKey('session-action-visible'),
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const SizedBox(height: 24),
+                  FilledButton.icon(
+                    style: (streaming || receiverActive)
+                        ? FilledButton.styleFrom(
+                            backgroundColor: Theme.of(
+                              context,
+                            ).colorScheme.errorContainer,
+                            foregroundColor: Theme.of(
+                              context,
+                            ).colorScheme.onErrorContainer,
+                          )
+                        : null,
+                    onPressed: defaultTargetPlatform == TargetPlatform.android
+                        ? (receiverBusy
+                              ? null
+                              : receiverActive
+                              ? stopReceiver
+                              : discoveredHosts.isNotEmpty
+                              ? () => connectInvitation(
+                                  discoveredHosts.first.invitation,
+                                )
+                              : () => unawaited(startDiscovery()))
+                        : (hostBusy
+                              ? null
+                              : streaming
+                              ? stopHost
+                              : canStartHost
+                              ? startHost
+                              : null),
+                    icon: receiverBusy || hostBusy
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Icon(
+                            streaming || receiverActive
+                                ? Icons.stop_rounded
+                                : defaultTargetPlatform ==
+                                      TargetPlatform.android
+                                ? Icons.wifi_find_rounded
+                                : Icons.play_arrow_rounded,
+                          ),
+                    label: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      child: Text(
+                        defaultTargetPlatform == TargetPlatform.android
+                            ? (receiverBusy
+                                  ? (receiverState == 'stopping'
+                                        ? 'Stopping receiver…'
+                                        : 'Connecting…')
+                                  : receiverActive
+                                  ? 'Stop receiver'
+                                  : discoveredHosts.isNotEmpty
+                                  ? 'Connect to ${discoveredHosts.first.name}'
+                                  : 'Try scanning again')
+                            : (hostBusy
+                                  ? (streaming
+                                        ? 'Stopping session…'
+                                        : 'Starting session…')
+                                  : streaming
+                                  ? 'Stop session'
+                                  : 'Start session'),
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          streaming || receiverActive
+                              ? Icons.check_circle_outline
+                              : Icons.info_outline,
+                          size: 16,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 7),
+                        Flexible(
+                          child: Text(
+                            sessionActionHint,
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (hostError != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Text(
+                        hostError!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+      ),
+    );
+  }
 
   Widget session() => ListView(
     children: [
@@ -684,7 +1091,7 @@ class _SonaraShellState extends State<SonaraShell> {
         const SizedBox(height: 16),
       ],
       if (defaultTargetPlatform == TargetPlatform.android) ...[
-        nearbyHostsPanel(),
+        androidSessionStatePanel(),
         const SizedBox(height: 16),
       ],
       Panel(
@@ -701,22 +1108,39 @@ class _SonaraShellState extends State<SonaraShell> {
             ),
             if (defaultTargetPlatform == TargetPlatform.windows) ...[
               const Divider(height: 24),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(
-                  streaming ? Icons.wifi_tethering : Icons.phone_android,
-                ),
-                title: Text(
-                  streaming
-                      ? 'Ready for an Android receiver'
-                      : 'Android receiver',
-                ),
-                subtitle: Text(
-                  streaming
-                      ? 'Nearby Android listeners can now discover this host automatically.'
-                      : 'Start the session to create a secure, device-independent invitation.',
-                ),
-              ),
+              if (connectedDevices.isEmpty)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(
+                    streaming ? Icons.wifi_tethering : Icons.phone_android,
+                  ),
+                  title: Text(
+                    streaming
+                        ? 'Waiting for mobile devices'
+                        : 'No mobile devices connected',
+                  ),
+                  subtitle: Text(
+                    streaming
+                        ? 'Nearby Android devices can discover this PC automatically.'
+                        : 'Start the session to accept mobile listeners.',
+                  ),
+                  trailing: StatusPill(
+                    label: streaming ? 'READY' : 'OFFLINE',
+                    active: streaming,
+                  ),
+                )
+              else
+                for (final device in connectedDevices)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.phone_android_rounded),
+                    title: Text(device),
+                    subtitle: const Text('Receiving audio from this PC'),
+                    trailing: const StatusPill(
+                      label: 'CONNECTED',
+                      active: true,
+                    ),
+                  ),
               if (streaming &&
                   (hostStatus['invitation'] as String? ?? '').isNotEmpty) ...[
                 const SizedBox(height: 8),
@@ -747,11 +1171,18 @@ class _SonaraShellState extends State<SonaraShell> {
                 leading: const Icon(Icons.speaker_phone_outlined),
                 title: Text(outputs.first.name),
                 subtitle: Text(
-                  '${outputs.first.route} · ${outputs.first.quality}',
+                  receiverConnected
+                      ? 'Connected · ${outputs.first.route}'
+                      : '${outputs.first.route} · ${outputs.first.quality}',
                 ),
-                trailing: receiverActive
-                    ? const Chip(label: Text('Active'))
-                    : const Chip(label: Text('Ready')),
+                trailing: StatusPill(
+                  label: receiverConnected
+                      ? 'CONNECTED'
+                      : receiverActive
+                      ? 'CONNECTING'
+                      : 'READY',
+                  active: receiverConnected,
+                ),
               ),
               const Text(
                 'Sonara follows Android’s current media output route. Change it from the system media output panel.',
@@ -812,54 +1243,7 @@ class _SonaraShellState extends State<SonaraShell> {
           ),
         ),
       ],
-      const SizedBox(height: 24),
-      FilledButton.icon(
-        onPressed: hostBusy
-            ? null
-            : defaultTargetPlatform == TargetPlatform.android
-            ? (receiverActive
-                  ? stopReceiver
-                  : discoveredHosts.isNotEmpty
-                  ? () => connectInvitation(discoveredHosts.first.invitation)
-                  : () => discovery?.scan())
-            : (streaming ? stopHost : startHost),
-        icon: Icon(
-          streaming || receiverState == 'playing'
-              ? Icons.stop_circle_outlined
-              : Icons.play_arrow_rounded,
-        ),
-        label: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 14),
-          child: Text(
-            defaultTargetPlatform == TargetPlatform.android
-                ? (receiverActive
-                      ? 'Stop receiver'
-                      : discoveredHosts.isNotEmpty
-                      ? 'Connect to ${discoveredHosts.first.name}'
-                      : 'Scanning for hosts…')
-                : (streaming ? 'Stop session' : 'Start session'),
-          ),
-        ),
-      ),
-      if (streaming)
-        Padding(
-          padding: const EdgeInsets.only(top: 14),
-          child: Center(
-            child: Text(
-              defaultTargetPlatform == TargetPlatform.windows
-                  ? 'Running in the background · closing the window minimizes Sonara to the tray'
-                  : 'Preparing output · timing quality remains visible until measured',
-            ),
-          ),
-        ),
-      if (hostError != null)
-        Padding(
-          padding: const EdgeInsets.only(top: 12),
-          child: Text(
-            hostError!,
-            style: TextStyle(color: Theme.of(context).colorScheme.error),
-          ),
-        ),
+      sessionActionArea(),
     ],
   );
 
@@ -870,42 +1254,80 @@ class _SonaraShellState extends State<SonaraShell> {
       if (defaultTargetPlatform == TargetPlatform.android) ...[
         Card(
           child: ListTile(
-            leading: const Icon(Icons.speaker_phone_outlined),
-            title: Text('Receiver · $receiverState'),
+            leading: Icon(
+              receiverConnected
+                  ? Icons.check_circle_rounded
+                  : Icons.speaker_phone_outlined,
+              color: receiverConnected ? Colors.green : null,
+            ),
+            title: Text(receiverDeviceName),
             subtitle: Text(
               receiverStatus['error'] as String? ??
-                  '${receiverStatus['packets_received'] ?? 0} packets · '
-                      '${receiverStatus['output_underruns'] ?? 0} underruns · '
-                      '${receiverStatus['output_silence_frames'] ?? 0} silence frames · '
-                      '${receiverStatus['rebuffer_events'] ?? 0} recoveries · '
-                      '${receiverStatus['output_dropped_frames'] ?? 0} stale frames skipped',
+                  (receiverConnected
+                      ? 'Connected to Sonara PC · ${receiverStatus['output_route'] ?? 'Platform output'}'
+                      : receiverActive
+                      ? 'Connecting to Sonara PC…'
+                      : 'Not connected'),
             ),
-            trailing: receiverState == 'idle' || receiverState == 'stopped'
-                ? null
-                : TextButton(
-                    onPressed: stopReceiver,
-                    child: const Text('Stop'),
-                  ),
+            trailing: receiverActive
+                ? FilledButton.tonalIcon(
+                    onPressed: receiverBusy ? null : stopReceiver,
+                    icon: receiverBusy
+                        ? const SizedBox.square(
+                            dimension: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.stop_rounded, size: 18),
+                    label: Text(receiverBusy ? 'Stopping…' : 'Stop'),
+                  )
+                : const StatusPill(label: 'OFFLINE', active: false),
           ),
         ),
         const SizedBox(height: 14),
-        nearbyHostsPanel(),
+        if (receiverActive) receiverConnectionPanel() else nearbyHostsPanel(),
         const SizedBox(height: 14),
       ] else if (defaultTargetPlatform == TargetPlatform.windows) ...[
         Card(
-          child: ListTile(
-            leading: Icon(streaming ? Icons.wifi_tethering : Icons.wifi_off),
-            title: Text(
-              streaming ? 'Windows host active' : 'Windows host idle',
-            ),
-            subtitle: Text(
-              streaming
-                  ? '${hostStatus['address']}:49812 · process ${hostStatus['source_pid']}'
-                  : '${sources.length} capturable windowed applications found',
-            ),
-            trailing: streaming
-                ? TextButton(onPressed: stopHost, child: const Text('Stop'))
-                : null,
+          child: Column(
+            children: [
+              ListTile(
+                leading: Icon(
+                  streaming ? Icons.wifi_tethering : Icons.wifi_off,
+                ),
+                title: Text(
+                  streaming ? 'Windows host active' : 'Windows host idle',
+                ),
+                subtitle: Text(
+                  streaming
+                      ? '${hostStatus['source_label'] ?? 'Audio source'} · ${hostStatus['address']}:49812'
+                      : '${sources.where((source) => source.pid > 0).length} capturable windowed applications found',
+                ),
+                trailing: streaming
+                    ? TextButton(onPressed: stopHost, child: const Text('Stop'))
+                    : null,
+              ),
+              if (streaming) ...[
+                const Divider(height: 1),
+                if (connectedDevices.isEmpty)
+                  const ListTile(
+                    leading: Icon(Icons.phone_android_outlined),
+                    title: Text('No mobile devices connected'),
+                    subtitle: Text('Waiting for a Sonara receiver'),
+                    trailing: StatusPill(label: 'WAITING', active: false),
+                  )
+                else
+                  for (final device in connectedDevices)
+                    ListTile(
+                      leading: const Icon(Icons.phone_android_rounded),
+                      title: Text(device),
+                      subtitle: const Text('Mobile receiver'),
+                      trailing: const StatusPill(
+                        label: 'CONNECTED',
+                        active: true,
+                      ),
+                    ),
+              ],
+            ],
           ),
         ),
         const SizedBox(height: 14),
@@ -940,103 +1362,177 @@ class _SonaraShellState extends State<SonaraShell> {
             ],
           ),
         ),
-      const SizedBox(height: 18),
-      OutlinedButton.icon(
-        onPressed: defaultTargetPlatform == TargetPlatform.android
-            ? importInvitation
-            : streaming
-            ? copyInvitation
-            : null,
-        icon: Icon(
-          defaultTargetPlatform == TargetPlatform.windows
-              ? Icons.copy
-              : Icons.qr_code_scanner,
-        ),
-        label: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Text(
-            defaultTargetPlatform == TargetPlatform.windows
-                ? 'Copy receiver invitation'
-                : 'Scan or paste invitation',
+      if (defaultTargetPlatform == TargetPlatform.windows) ...[
+        const SizedBox(height: 18),
+        OutlinedButton.icon(
+          onPressed: streaming ? copyInvitation : null,
+          icon: const Icon(Icons.copy),
+          label: const Padding(
+            padding: EdgeInsets.all(12),
+            child: Text('Copy receiver invitation'),
           ),
         ),
-      ),
+      ],
     ],
   );
+
+  List<DiagnosticDatum> get diagnosticItems {
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return [
+        DiagnosticDatum(
+          'Session',
+          streaming ? 'Active' : 'Idle',
+          streaming ? 'Host process is running' : 'No active capture',
+          streaming ? Icons.podcasts_rounded : Icons.pause_circle_outline,
+        ),
+        DiagnosticDatum(
+          'Source',
+          hostStatus['source_label'] as String? ?? '—',
+          hostStatus['source_kind'] == 'system'
+              ? 'All audible applications'
+              : 'Selected process tree',
+          Icons.graphic_eq_rounded,
+        ),
+        DiagnosticDatum(
+          'Network',
+          hostStatus['address'] as String? ?? '—',
+          streaming ? 'QUIC · port 49812' : 'Not listening',
+          Icons.lan_outlined,
+        ),
+        DiagnosticDatum(
+          'Pairing',
+          (hostStatus['invitation'] as String? ?? '').isNotEmpty
+              ? 'Ready'
+              : streaming
+              ? 'Starting'
+              : 'Closed',
+          'Secure invitation state',
+          Icons.verified_user_outlined,
+        ),
+        DiagnosticDatum(
+          'Listening mode',
+          _readableValue(hostStatus['mode'] ?? mode.name),
+          'Shared presentation policy',
+          Icons.sync_rounded,
+        ),
+        DiagnosticDatum(
+          'Buffer profile',
+          _readableValue(hostStatus['profile'] ?? profile.name),
+          'Applied to connected receivers',
+          Icons.tune_rounded,
+        ),
+      ];
+    }
+    return [
+      DiagnosticDatum(
+        'Receiver',
+        _readableValue(receiverState),
+        receiverStatus['output_route'] as String? ?? 'Platform output',
+        receiverActive ? Icons.speaker_rounded : Icons.speaker_outlined,
+      ),
+      DiagnosticDatum(
+        'Packets',
+        '${receiverStatus['packets_received'] ?? 0}',
+        '${receiverStatus['packets_lost'] ?? 0} lost · ${receiverStatus['redundant_packets'] ?? 0} duplicates',
+        Icons.swap_vert_circle_outlined,
+      ),
+      DiagnosticDatum(
+        'Adaptive buffer',
+        receiverStatus['adaptive_buffer_ms'] == null
+            ? '—'
+            : '${_compactNumber(receiverStatus['adaptive_buffer_ms'])} ms',
+        '${receiverStatus['buffered_frames'] ?? 0} frames queued',
+        Icons.storage_rounded,
+      ),
+      DiagnosticDatum(
+        'Clock uncertainty',
+        receiverStatus['clock_uncertainty_ms'] == null
+            ? '—'
+            : '${_compactNumber(receiverStatus['clock_uncertainty_ms'])} ms',
+        '${receiverStatus['rate_correction_ppm'] ?? 0} ppm correction',
+        Icons.schedule_rounded,
+      ),
+      DiagnosticDatum(
+        'Output health',
+        '${receiverStatus['output_underruns'] ?? 0} underruns',
+        '${receiverStatus['rebuffer_events'] ?? 0} recoveries · ${receiverStatus['output_dropped_frames'] ?? 0} stale frames',
+        Icons.monitor_heart_outlined,
+      ),
+      DiagnosticDatum(
+        'Rendered',
+        '${receiverStatus['frames_rendered'] ?? 0} frames',
+        '${receiverStatus['output_silence_frames'] ?? 0} silence frames inserted',
+        Icons.multiline_chart_rounded,
+      ),
+    ];
+  }
+
+  String _readableValue(Object? value) => '$value'
+      .replaceAll('_', ' ')
+      .replaceAllMapped(
+        RegExp(r'([a-z])([A-Z])'),
+        (match) => '${match.group(1)} ${match.group(2)}',
+      )
+      .trim()
+      .split(' ')
+      .where((part) => part.isNotEmpty)
+      .map((part) => '${part[0].toUpperCase()}${part.substring(1)}')
+      .join(' ');
+
+  String _compactNumber(Object? value) {
+    if (value is! num) return '$value';
+    if (value == value.roundToDouble()) return value.toInt().toString();
+    return value.toStringAsFixed(2);
+  }
 
   Widget diagnostics() => ListView(
     children: [
       const Heading(
         'Diagnostics',
-        'Measured status — unknown values stay unknown.',
+        'Live engine state and measured playback health.',
       ),
-      const SizedBox(height: 22),
-      Wrap(
-        spacing: 14,
-        runSpacing: 14,
-        children: [
-          Metric(
-            'Session',
-            defaultTargetPlatform == TargetPlatform.windows
-                ? (streaming ? 'active' : 'idle')
-                : receiverState,
-            defaultTargetPlatform == TargetPlatform.windows
-                ? 'Native WASAPI host state'
-                : 'Native receiver state',
-          ),
-          Metric(
-            'Network',
-            defaultTargetPlatform == TargetPlatform.windows
-                ? (hostStatus['address'] as String? ?? '—')
-                : '${receiverStatus['packets_received'] ?? '—'} packets',
-            defaultTargetPlatform == TargetPlatform.windows
-                ? (streaming ? 'UDP/QUIC port 49812' : 'Not listening')
-                : '${receiverStatus['packets_lost'] ?? '—'} lost',
-          ),
-          Metric(
-            'Clock uncertainty',
-            receiverStatus['clock_uncertainty_ms'] == null
-                ? '—'
-                : '${receiverStatus['clock_uncertainty_ms']} ms',
-            'Correction ${receiverStatus['rate_correction_ppm'] ?? '—'} ppm',
-          ),
-          Metric(
-            'Output',
-            '${receiverStatus['frames_rendered'] ?? '—'} frames',
-            '${receiverStatus['buffered_frames'] ?? '—'} buffered · '
-                '${receiverStatus['output_underruns'] ?? '—'} underruns · '
-                '${receiverStatus['output_silence_frames'] ?? '—'} silence frames · '
-                '${receiverStatus['rebuffer_events'] ?? '—'} recoveries · '
-                '${receiverStatus['output_dropped_frames'] ?? '—'} stale frames skipped',
-          ),
-          Metric(
-            'Target buffer',
-            receiverStatus['target_buffer_ms'] == null
-                ? '—'
-                : '${receiverStatus['adaptive_buffer_ms'] ?? receiverStatus['target_buffer_ms']} ms adaptive',
-            receiverStatus['packet_duration_ms'] == null
-                ? 'Negotiated when a receiver connects'
-                : '${receiverStatus['packet_duration_ms']} ms packets · ${receiverStatus['profile'] ?? 'dynamic'}',
-          ),
-          Metric(
-            'Interface',
-            defaultTargetPlatform == TargetPlatform.windows
-                ? 'Automatic'
-                : 'Android',
-            'Selected dynamically from active platform interfaces',
-          ),
-        ],
+      const SizedBox(height: 18),
+      Panel(
+        child: Row(
+          children: [
+            Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                color: streaming || receiverActive
+                    ? Colors.green
+                    : Theme.of(context).colorScheme.outline,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                streaming || receiverActive
+                    ? 'Live telemetry · 10t/s'
+                    : 'Live telemetry · offline',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+            StatusPill(
+              label: streaming || receiverActive ? 'LIVE' : 'IDLE',
+              active: streaming || receiverActive,
+            ),
+          ],
+        ),
       ),
-      const SizedBox(height: 20),
+      const SizedBox(height: 14),
+      DiagnosticsGrid(items: diagnosticItems),
+      const SizedBox(height: 14),
       Panel(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Label('TIMING CONFIDENCE'),
-            const SizedBox(height: 12),
+            const SizedBox(height: 9),
             Text(
               timingConfidence,
-              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 6),
             Text(timingExplanation),
@@ -1124,8 +1620,148 @@ class _SonaraShellState extends State<SonaraShell> {
           ),
         ),
       ),
+      const SizedBox(height: 16),
+      Card(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ListTile(
+              leading: ClipRRect(
+                borderRadius: BorderRadius.circular(9),
+                child: Image.asset(
+                  'assets/branding/app_mark.png',
+                  width: 40,
+                  height: 40,
+                  filterQuality: FilterQuality.high,
+                ),
+              ),
+              title: const Text('Sonara'),
+              subtitle: const Text('Version 1.0.0 · Open source under MIT'),
+            ),
+            const Divider(height: 1),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 14, 16, 8),
+              child: Text(
+                'Built with Flutter, Rust, QUIC, and Oboe for direct local-network audio. '
+                'The source code and license are included with this project.',
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12),
+              child: Wrap(
+                spacing: 7,
+                runSpacing: 7,
+                children: [
+                  Chip(label: Text('Flutter')),
+                  Chip(label: Text('Rust')),
+                  Chip(label: Text('QUIC')),
+                  Chip(label: Text('Oboe')),
+                  Chip(label: Text('MIT License')),
+                ],
+              ),
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => showLicensePage(
+                  context: context,
+                  applicationName: 'Sonara',
+                  applicationVersion: '1.0.0',
+                  applicationLegalese:
+                      '© 2026 Sonara contributors · MIT License',
+                  applicationIcon: ClipRRect(
+                    borderRadius: BorderRadius.circular(9),
+                    child: Image.asset(
+                      'assets/branding/app_mark.png',
+                      width: 44,
+                      height: 44,
+                    ),
+                  ),
+                ),
+                icon: const Icon(Icons.article_outlined),
+                label: const Text('Open-source licenses'),
+              ),
+            ),
+          ],
+        ),
+      ),
     ],
   );
+}
+
+class InvitationDialog extends StatefulWidget {
+  const InvitationDialog({super.key, required this.validator});
+  final FormFieldValidator<String> validator;
+
+  @override
+  State<InvitationDialog> createState() => _InvitationDialogState();
+}
+
+class _InvitationDialogState extends State<InvitationDialog> {
+  final controller = TextEditingController();
+  final formKey = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Connect this receiver'),
+    content: Form(
+      key: formKey,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          TextFormField(
+            controller: controller,
+            autofocus: true,
+            minLines: 3,
+            maxLines: 6,
+            validator: widget.validator,
+            textInputAction: TextInputAction.done,
+            onFieldSubmitted: (_) => submit(),
+            decoration: const InputDecoration(
+              labelText: 'Sonara invitation',
+              hintText: 'sonara1:…',
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: pasteInvitation,
+              icon: const Icon(Icons.content_paste_rounded, size: 18),
+              label: const Text('Paste from clipboard'),
+            ),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(onPressed: submit, child: const Text('Connect')),
+    ],
+  );
+
+  void submit() {
+    if (formKey.currentState?.validate() == true) {
+      Navigator.pop(context, controller.text.trim());
+    }
+  }
+
+  Future<void> pasteInvitation() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim();
+    if (!mounted || text == null || text.isEmpty) return;
+    controller.text = text;
+    formKey.currentState?.validate();
+  }
 }
 
 class SideNav extends StatelessWidget {
@@ -1176,7 +1812,9 @@ class SideNav extends StatelessWidget {
 }
 
 class Wordmark extends StatelessWidget {
-  const Wordmark({super.key});
+  const Wordmark({super.key, this.compact = false});
+  final bool compact;
+
   @override
   Widget build(BuildContext context) => Row(
     mainAxisSize: MainAxisSize.min,
@@ -1185,16 +1823,16 @@ class Wordmark extends StatelessWidget {
         borderRadius: BorderRadius.circular(7),
         child: Image.asset(
           'assets/branding/app_mark.png',
-          width: 28,
-          height: 28,
+          width: compact ? 24 : 28,
+          height: compact ? 24 : 28,
           filterQuality: FilterQuality.high,
         ),
       ),
-      const SizedBox(width: 9),
-      const Text(
+      SizedBox(width: compact ? 7 : 9),
+      Text(
         'sonara',
         style: TextStyle(
-          fontSize: 22,
+          fontSize: compact ? 19 : 22,
           fontWeight: FontWeight.w700,
           letterSpacing: -.5,
         ),
@@ -1207,20 +1845,29 @@ class Heading extends StatelessWidget {
   const Heading(this.title, this.subtitle, {super.key});
   final String title, subtitle;
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      Text(
-        title,
-        style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-          fontWeight: FontWeight.w700,
-          color: Theme.of(context).brightness == Brightness.light ? ink : null,
+  Widget build(BuildContext context) {
+    final showSubtitle =
+        defaultTargetPlatform != TargetPlatform.android &&
+        subtitle.trim().isNotEmpty;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+            fontWeight: FontWeight.w700,
+            color: Theme.of(context).brightness == Brightness.light
+                ? ink
+                : null,
+          ),
         ),
-      ),
-      const SizedBox(height: 5),
-      Text(subtitle, style: Theme.of(context).textTheme.bodyLarge),
-    ],
-  );
+        if (showSubtitle) ...[
+          const SizedBox(height: 5),
+          Text(subtitle, style: Theme.of(context).textTheme.bodyLarge),
+        ],
+      ],
+    );
+  }
 }
 
 class Label extends StatelessWidget {
@@ -1296,29 +1943,156 @@ class OutputRow extends StatelessWidget {
   );
 }
 
+class NearbyHostTile extends StatelessWidget {
+  const NearbyHostTile({
+    super.key,
+    required this.host,
+    required this.trusted,
+    required this.enabled,
+    required this.busy,
+    required this.onConnect,
+  });
+
+  final DiscoveredHost host;
+  final bool trusted;
+  final bool enabled;
+  final bool busy;
+  final VoidCallback onConnect;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final button = FilledButton.tonalIcon(
+        onPressed: enabled ? onConnect : null,
+        icon: busy
+            ? const SizedBox.square(
+                dimension: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.link),
+        label: Text(busy ? 'Connecting…' : 'Connect'),
+      );
+      final tile = ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: const CircleAvatar(child: Icon(Icons.computer)),
+        title: Text(host.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+        subtitle: Text(
+          '${host.address} · ${trusted ? 'trusted host' : 'encrypted session'}',
+        ),
+        trailing: constraints.maxWidth >= 520 ? button : null,
+      );
+      if (constraints.maxWidth >= 520) return tile;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [tile, button, const SizedBox(height: 8)],
+      );
+    },
+  );
+}
+
+class DiagnosticDatum {
+  const DiagnosticDatum(this.label, this.value, this.note, this.icon);
+  final String label;
+  final String value;
+  final String note;
+  final IconData icon;
+}
+
+class DiagnosticsGrid extends StatelessWidget {
+  const DiagnosticsGrid({super.key, required this.items});
+  final List<DiagnosticDatum> items;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final columns = constraints.maxWidth >= 850
+          ? 3
+          : constraints.maxWidth >= 520
+          ? 2
+          : 1;
+      const gap = 12.0;
+      final width = (constraints.maxWidth - gap * (columns - 1)) / columns;
+      return Wrap(
+        spacing: gap,
+        runSpacing: gap,
+        children: [for (final item in items) Metric(item: item, width: width)],
+      );
+    },
+  );
+}
+
 class Metric extends StatelessWidget {
-  const Metric(this.label, this.value, this.note, {super.key});
-  final String label, value, note;
+  const Metric({super.key, required this.item, required this.width});
+  final DiagnosticDatum item;
+  final double width;
+
   @override
   Widget build(BuildContext context) => SizedBox(
-    width: 285,
+    width: width,
+    height: 136,
     child: Card(
       child: Padding(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(label),
-            const SizedBox(height: 7),
-            Text(
-              value,
-              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+            Row(
+              children: [
+                Icon(
+                  item.icon,
+                  size: 18,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                const SizedBox(width: 8),
+                Text(item.label, style: Theme.of(context).textTheme.labelLarge),
+              ],
             ),
-            const SizedBox(height: 5),
-            Text(note, style: Theme.of(context).textTheme.bodySmall),
+            const Spacer(),
+            Text(
+              item.value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              item.note,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ],
         ),
       ),
     ),
   );
+}
+
+class StatusPill extends StatelessWidget {
+  const StatusPill({super.key, required this.label, required this.active});
+  final String label;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: active
+            ? Colors.green.withValues(alpha: .13)
+            : colors.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          letterSpacing: .8,
+          color: active ? Colors.green.shade700 : colors.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
 }

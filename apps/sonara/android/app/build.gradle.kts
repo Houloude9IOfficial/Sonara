@@ -21,7 +21,11 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        // Android 16's opt-in local-network gate is inconsistent on some OEM
+        // builds even after NEARBY_WIFI_DEVICES is granted. Target 35 retains
+        // Android's documented INTERNET-based compatibility grant. Move to 37
+        // with ACCESS_LOCAL_NETWORK once that API is available in the toolchain.
+        targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         externalNativeBuild {

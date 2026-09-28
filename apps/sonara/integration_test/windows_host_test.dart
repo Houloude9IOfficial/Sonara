@@ -26,18 +26,25 @@ void main() {
       final source = Map<dynamic, dynamic>.from(rawSources!.first as Map);
       final pid = source['pid'];
       expect(pid, isA<int>());
-      expect(pid as int, greaterThan(0));
-      expect(source['name'], isNotEmpty);
+      expect(pid, 0);
+      expect(source['name'], 'System audio');
       expect(source['title'], isNotEmpty);
 
-      final rawStart = await channel.invokeMethod<Map<dynamic, dynamic>>(
-        'start',
-        {'pid': pid, 'mode': 'synchronized', 'profile': 'balanced'},
-      );
+      final rawStart = await channel
+          .invokeMethod<Map<dynamic, dynamic>>('start', {
+            'pid': pid,
+            'systemAudio': true,
+            'sourceLabel': source['name'],
+            'mode': 'synchronized',
+            'profile': 'balanced',
+          });
       expect(rawStart, isNotNull);
       final started = Map<dynamic, dynamic>.from(rawStart!);
       expect(started['active'], isTrue);
       expect(started['source_pid'], pid);
+      expect(started['source_kind'], 'system');
+      expect(started['source_label'], 'System audio');
+      expect(started['connected_devices'], isEmpty);
       expect(started['address'], matches(RegExp(r'^\d{1,3}(\.\d{1,3}){3}$')));
       expect(started['address'], isNot('YOUR_PC_IP'));
 
@@ -52,9 +59,10 @@ void main() {
       }
       expect(status['active'], isTrue);
       expect(status['invitation'], startsWith('sonara1:'));
+      expect(status['connected_devices'], isA<List<dynamic>>());
 
       final discoverySocket = await RawDatagramSocket.bind(
-        InternetAddress.loopbackIPv4,
+        InternetAddress.anyIPv4,
         0,
       );
       addTearDown(discoverySocket.close);
@@ -64,7 +72,9 @@ void main() {
         final datagram = discoverySocket.receive();
         if (datagram == null) return;
         final host = DiscoveredHost.tryParse(datagram.data, datagram.address);
-        if (host != null && !announcement.isCompleted) {
+        if (host != null &&
+            host.invitation == status['invitation'] &&
+            !announcement.isCompleted) {
           announcement.complete(host);
         }
       });
@@ -76,7 +86,7 @@ void main() {
       ) {
         discoverySocket.send(
           utf8.encode(sonaraDiscoveryProbe),
-          InternetAddress.loopbackIPv4,
+          InternetAddress(started['address'] as String),
           sonaraDiscoveryPort,
         );
         await Future<void>.delayed(const Duration(milliseconds: 100));

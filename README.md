@@ -16,7 +16,7 @@ flutter build windows --release
 .\build\windows\x64\runner\Release\sonara.exe
 ```
 
-Choose a running application in the dynamic source list and click **Start session**. Android listeners on the same Wi-Fi, Ethernet, or tethered LAN discover the PC automatically and connect with one tap; copy/paste remains only as a fallback. The desktop app selects an active LAN address itself—there is no PID or `YOUR_PC_IP` placeholder to replace. Closing the window hides it to the notification area while the host remains active; double-click the Sonara tray icon to restore it, or right-click it and choose **Exit**. The release directory is the portable app: keep its DLL, `data` folder, and internal `sonara_engine.exe` beside `sonara.exe`.
+Choose **System audio** to send everything audible on the PC, or choose any running application from the dynamic source list, then click **Start session**. Android listeners on the same Wi-Fi, Ethernet, or tethered LAN discover the PC automatically and connect with one tap; copy/paste remains only as a fallback. The desktop app selects an active LAN address itself—there is no PID or `YOUR_PC_IP` placeholder to replace. Closing the window hides it to the notification area while the host remains active; double-click the Sonara tray icon to restore it, or right-click it and choose **Exit**. The release directory is the portable app: keep its DLL, `data` folder, and internal `sonara_engine.exe` beside `sonara.exe`.
 
 ### Developer CLI
 
@@ -38,7 +38,7 @@ On Android, open **Session** or **Devices** and select the PC under **Nearby Son
 
 Low Delay + Balanced is the default measured profile. It starts with a 20 ms software render queue and can adapt up to 60 ms when the network or platform genuinely underruns. Ultra Low adapts from 10–30 ms and Stable from 50–150 ms in Low Delay mode (up to 240 ms in Synchronized mode). A recovery pauses consumption once, refills at a slightly larger target, and resumes; after ten stable seconds the target steps back down. Stale audio remains bounded instead of allowing delay to grow indefinitely. These are software queue targets, not guaranteed capture-to-speaker latency; Android hardware, Wi-Fi scheduling, and the selected output route add time. Sonara also cannot delay an unmanaged PC speaker, so exact acoustic synchronization with audio still playing directly on the PC requires a future Sonara-controlled local output path.
 
-The CLI also exposes `devices` and `sources`. `host --test-tone`, `host --pid`, and `receive` exercise the real QUIC datagram path. Low-latency pairing performs 12 initial clock exchanges at 100 Hz and continues probing at 2 Hz while streaming. The process path requests 48 kHz PCM16 stereo directly from WASAPI, carries capture QPC timestamps into packet source time, joins Windows' Pro Audio scheduling class, and uses a bounded 16-block capture ring that expires old audio instead of accumulating latency. Packets split from a WASAPI block are paced on absolute media deadlines instead of being emitted as a burst. Windows requests 1 ms timer resolution and test-tone pacing delays after missed ticks rather than sending catch-up bursts.
+The CLI also exposes `devices` and `sources`. `host --system-audio`, `host --test-tone`, `host --pid`, and `receive` exercise the real QUIC datagram path. Low-latency pairing performs 12 initial clock exchanges at 100 Hz and continues probing at 2 Hz while streaming. The process and system paths request 48 kHz PCM16 stereo directly from WASAPI, carry capture QPC timestamps into packet source time, join Windows' Pro Audio scheduling class, and use a bounded 16-block capture ring that expires old audio instead of accumulating latency. Packets split from a WASAPI block are paced on absolute media deadlines instead of being emitted as a burst. Windows requests 1 ms timer resolution and test-tone pacing delays after missed ticks rather than sending catch-up bursts.
 
 To measure real speaker-to-speaker skew, record both outputs as separate channels using one shared-clock recorder, then run:
 
@@ -78,6 +78,17 @@ Android builds require Rust targets `aarch64-linux-android` and `x86_64-linux-an
 
 ## Package releases
 
+Run the persistent interactive builder from the repository root:
+
+```powershell
+python .\build.py
+```
+
+Choose Android, Windows, or All, followed by Production or Debug. Android and
+Windows use separately labelled live output channels, and the builder prints
+the resulting `.apk` and `.exe` paths before returning to its menu. macOS is the
+next planned platform slot.
+
 Run the end-to-end packager from the repository root:
 
 ```powershell
@@ -85,5 +96,28 @@ Run the end-to-end packager from the repository root:
 ```
 
 It builds the Windows release bundle, portable ZIP, unsigned per-user installer, and a developer-signed Android release APK under `dist`. On its first Android run it creates a dedicated local release key and credentials under `apps/sonara/android`; both are ignored by Git. Back them up securely—losing the key prevents in-place updates to installed APKs. SHA-256 sidecar files are generated for every distributable.
+
+### GitHub releases
+
+Publishing a GitHub Release runs `.github/workflows/release.yml`. Windows and
+Android production packages are built on their native CI lanes and attached to
+that release with SHA-256 sidecars. The macOS lane is already present and
+activates automatically after the Flutter macOS project is added. A manual run
+can update an existing release by supplying its tag; matching assets are
+replaced.
+
+Configure these Actions secrets before publishing a release so every Android
+version uses the same signing identity:
+
+- `SONARA_ANDROID_KEYSTORE_BASE64` — base64-encoded `release-key.jks`
+- `SONARA_ANDROID_STORE_PASSWORD`
+- `SONARA_ANDROID_KEY_ALIAS`
+- `SONARA_ANDROID_KEY_PASSWORD`
+
+For PowerShell, create the first value without changing the keystore:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('apps/sonara/android/release-key.jks'))
+```
 
 See [PLAN.md](PLAN.md) and [architecture status](docs/architecture/README.md). Licensed under MIT.

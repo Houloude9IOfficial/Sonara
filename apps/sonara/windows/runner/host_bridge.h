@@ -32,6 +32,9 @@ class HostBridge {
   std::wstring log_path_;
   std::string invitation_;
   std::string address_;
+  std::string source_label_;
+  std::string mode_;
+  std::string profile_;
   DWORD source_pid_ = 0;
 };
 

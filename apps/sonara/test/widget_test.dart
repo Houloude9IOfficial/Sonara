@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -22,8 +24,13 @@ void main() {
     try {
       await tester.binding.setSurfaceSize(const Size(1200, 1000));
       await tester.pumpWidget(const SonaraApp());
-      expect(find.text('Scanning for hosts…'), findsOneWidget);
+      expect(find.text('Scan for hosts'), findsNothing);
       expect(find.text('Scanning the local network…'), findsOneWidget);
+      expect(find.byTooltip('Scan again'), findsOneWidget);
+      expect(
+        find.text('Connect this device to a nearby Sonara PC.'),
+        findsNothing,
+      );
       expect(find.text('Audio source'), findsNothing);
       expect(find.text('LISTENING'), findsNothing);
       expect(find.textContaining('Galaxy'), findsNothing);
@@ -35,6 +42,27 @@ void main() {
       await tester.tap(find.widgetWithText(FilledButton, 'Connect'));
       await tester.pump();
       expect(find.text('Enter an invitation first.'), findsOneWidget);
+
+      final validPayload = base64Url
+          .encode(
+            utf8.encode(
+              jsonEncode({
+                'id': 'test-id',
+                'host_fingerprint': 'sha256:test',
+                'endpoints': ['192.168.1.2:49812'],
+                'token': 'test-token',
+              }),
+            ),
+          )
+          .replaceAll('=', '');
+      await tester.enterText(
+        find.byType(TextFormField),
+        'sonara1:$validPayload',
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Connect'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.text('Connect this receiver'), findsNothing);
       await tester.binding.setSurfaceSize(null);
     } finally {
       debugDefaultTargetPlatformOverride = null;

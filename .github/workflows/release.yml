@@ -1,0 +1,168 @@
+name: Production release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to update (leave empty to build only)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sonara-release-${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows production
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check pillow
+          choco install innosetup --yes --no-progress
+      - name: Build and package
+        shell: pwsh
+        run: ./tools/packaging/build-release.ps1 -Platform Windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-production
+          if-no-files-found: error
+          path: |
+            dist/Sonara-*-windows-x64-setup.exe
+            dist/Sonara-*-windows-x64-setup.exe.sha256
+            dist/Sonara-*-windows-x64-portable.zip
+            dist/Sonara-*-windows-x64-portable.zip.sha256
+
+  android:
+    name: Android production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - name: Install Rust Android builder
+        run: cargo install cargo-ndk --locked
+      - name: Configure Android release signing
+        working-directory: apps/sonara/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SONARA_ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SONARA_ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SONARA_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SONARA_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+            echo 'Android release-signing secrets are not configured.' >&2
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > release-key.jks
+          {
+            echo 'storeFile=release-key.jks'
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > key.properties
+      - name: Test Flutter application
+        working-directory: apps/sonara
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+      - name: Build and package
+        shell: pwsh
+        run: ./tools/packaging/build-release.ps1 -Platform Android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-production
+          if-no-files-found: error
+          path: |
+            dist/Sonara-*-android.apk
+            dist/Sonara-*-android.apk.sha256
+
+  macos:
+    name: macOS production (ready when project is added)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect macOS project
+        id: project
+        shell: bash
+        run: |
+          if [[ -d apps/sonara/macos ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'macOS project is not present yet; this lane will activate automatically once it is added.'
+          fi
+      - uses: subosito/flutter-action@v2
+        if: steps.project.outputs.available == 'true'
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.project.outputs.available == 'true'
+      - name: Build and package
+        if: steps.project.outputs.available == 'true'
+        working-directory: apps/sonara
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build macos --release
+          version="$(sed -nE 's/^version: *([^+ ]+).*/\1/p' pubspec.yaml | head -1)"
+          mkdir -p ../../dist
+          app_path="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app_path" \
+            "../../dist/Sonara-${version}-macos-universal.zip"
+          cd ../../dist
+          shasum -a 256 "Sonara-${version}-macos-universal.zip" > \
+            "Sonara-${version}-macos-universal.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        if: steps.project.outputs.available == 'true'
+        with:
+          name: macos-production
+          if-no-files-found: error
+          path: |
+            dist/Sonara-*-macos-universal.zip
+            dist/Sonara-*-macos-universal.zip.sha256
+
+  publish:
+    name: Attach production builds to release
+    needs: [windows, android, macos]
+    if: >-
+      ${{ always() && needs.windows.result == 'success' &&
+          needs.android.result == 'success' && needs.macos.result == 'success' &&
+          (github.event_name == 'release' || inputs.release_tag != '') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Upload or replace release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"

@@ -56,6 +56,32 @@ std::string ReadTextFile(const std::wstring& path) {
                      std::istreambuf_iterator<char>());
 }
 
+EncodableList ReadReceiverRoster(const std::wstring& path) {
+  const std::string log = ReadTextFile(path);
+  constexpr const char* marker = "SONARA_RECEIVERS";
+  const size_t marker_position = log.rfind(marker);
+  EncodableList devices;
+  if (marker_position == std::string::npos) {
+    return devices;
+  }
+  const size_t line_end = log.find_first_of("\r\n", marker_position);
+  const size_t value_start = marker_position + std::char_traits<char>::length(marker);
+  if (value_start >= log.size() || log[value_start] != '\t') {
+    return devices;
+  }
+  const std::string values = log.substr(
+      value_start + 1,
+      (line_end == std::string::npos ? log.size() : line_end) - value_start - 1);
+  std::stringstream stream(values);
+  std::string name;
+  while (std::getline(stream, name, '\t')) {
+    if (!name.empty()) {
+      devices.emplace_back(name);
+    }
+  }
+  return devices;
+}
+
 std::string FileNameFromPath(const std::wstring& path) {
   return Utf8FromUtf16(std::filesystem::path(path).stem().c_str());
 }
@@ -116,6 +142,11 @@ EncodableList ListSources() {
               return left.name < right.name;
             });
   EncodableList result;
+  result.emplace_back(EncodableMap{
+      {EncodableValue("pid"), EncodableValue(0)},
+      {EncodableValue("name"), EncodableValue("System audio")},
+      {EncodableValue("title"), EncodableValue("All audible applications")},
+  });
   for (const auto& source : sources) {
     result.emplace_back(EncodableMap{
         {EncodableValue("pid"), EncodableValue(static_cast<int>(source.pid))},
@@ -290,6 +321,9 @@ void HostBridge::Stop() {
   }
   invitation_.clear();
   source_pid_ = 0;
+  source_label_.clear();
+  mode_.clear();
+  profile_.clear();
 }
 
 void HostBridge::HandleMethodCall(
@@ -314,8 +348,16 @@ void HostBridge::HandleMethodCall(
         {EncodableValue("active"), EncodableValue(running)},
         {EncodableValue("source_pid"),
          EncodableValue(static_cast<int>(source_pid_))},
+        {EncodableValue("source_label"), EncodableValue(source_label_)},
+        {EncodableValue("source_kind"),
+         EncodableValue(source_pid_ == 0 ? "system" : "application")},
+        {EncodableValue("mode"), EncodableValue(mode_)},
+        {EncodableValue("profile"), EncodableValue(profile_)},
         {EncodableValue("address"), EncodableValue(address_)},
         {EncodableValue("invitation"), EncodableValue(invitation_)},
+        {EncodableValue("connected_devices"),
+         EncodableValue(running ? ReadReceiverRoster(log_path_)
+                                : EncodableList{})},
     }));
     return;
   }
@@ -349,6 +391,14 @@ void HostBridge::HandleMethodCall(
   const int* pid = arguments == nullptr
                        ? nullptr
                        : ReadArgument<int>(*arguments, "pid");
+  const bool* system_audio =
+      arguments == nullptr
+          ? nullptr
+          : ReadArgument<bool>(*arguments, "systemAudio");
+  const std::string* source_label =
+      arguments == nullptr
+          ? nullptr
+          : ReadArgument<std::string>(*arguments, "sourceLabel");
   const std::string* mode = arguments == nullptr
                                 ? nullptr
                                 : ReadArgument<std::string>(*arguments, "mode");
@@ -356,7 +406,10 @@ void HostBridge::HandleMethodCall(
       arguments == nullptr
           ? nullptr
           : ReadArgument<std::string>(*arguments, "profile");
-  if (pid == nullptr || *pid <= 0 || mode == nullptr || profile == nullptr) {
+  const bool capture_system = system_audio != nullptr && *system_audio;
+  const bool valid_application = !capture_system && pid != nullptr && *pid > 0;
+  if ((!capture_system && !valid_application) || mode == nullptr ||
+      profile == nullptr || source_label == nullptr || source_label->empty()) {
     result->Error("arguments", "A valid source, mode, and profile are required");
     return;
   }
@@ -385,8 +438,13 @@ void HostBridge::HandleMethodCall(
   const std::wstring mode_w(mode->begin(), mode->end());
   const std::wstring profile_w(profile->begin(), profile->end());
   std::wstringstream command;
-  command << Quote(engine) << L" host --pid " << *pid
-          << L" --listen 0.0.0.0:49812";
+  command << Quote(engine) << L" host ";
+  if (capture_system) {
+    command << L"--system-audio ";
+  } else {
+    command << L"--pid " << *pid << L" ";
+  }
+  command << L"--listen 0.0.0.0:49812";
   for (const std::string& candidate : addresses) {
     command << L" --advertise "
             << std::wstring(candidate.begin(), candidate.end()) << L":49812";
@@ -426,13 +484,23 @@ void HostBridge::HandleMethodCall(
   if (job_ != nullptr) {
     AssignProcessToJobObject(job_, process_.hProcess);
   }
-  source_pid_ = static_cast<DWORD>(*pid);
+  source_pid_ = capture_system ? 0 : static_cast<DWORD>(*pid);
+  source_label_ = *source_label;
+  mode_ = *mode;
+  profile_ = *profile;
 
   result->Success(EncodableValue(EncodableMap{
       {EncodableValue("active"), EncodableValue(true)},
       {EncodableValue("state"), EncodableValue("starting")},
-      {EncodableValue("source_pid"), EncodableValue(*pid)},
+      {EncodableValue("source_pid"),
+       EncodableValue(static_cast<int>(source_pid_))},
+      {EncodableValue("source_label"), EncodableValue(source_label_)},
+      {EncodableValue("source_kind"),
+       EncodableValue(capture_system ? "system" : "application")},
+      {EncodableValue("mode"), EncodableValue(mode_)},
+      {EncodableValue("profile"), EncodableValue(profile_)},
       {EncodableValue("address"), EncodableValue(address_)},
       {EncodableValue("invitation"), EncodableValue("")},
+      {EncodableValue("connected_devices"), EncodableValue(EncodableList{})},
   }));
 }

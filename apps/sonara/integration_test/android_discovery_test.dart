@@ -29,11 +29,25 @@ void main() {
     addTearDown(subscription.cancel);
     await discovery.start();
 
+    final invitationPayload = base64Url
+        .encode(
+          utf8.encode(
+            jsonEncode({
+              'id': 'device-test',
+              'host_fingerprint': 'test-fingerprint',
+              'endpoints': ['127.0.0.1:49812'],
+              'token': 'test-token',
+            }),
+          ),
+        )
+        .replaceAll('=', '');
+    final invitation = 'sonara1:$invitationPayload';
+
     final announcement = utf8.encode(
       jsonEncode({
         'protocol': sonaraDiscoveryProtocol,
         'name': 'Dynamic test host',
-        'invitation': 'sonara1:device-test',
+        'invitation': invitation,
       }),
     );
     for (var attempt = 0; attempt < 10 && !found.isCompleted; attempt++) {
@@ -48,6 +62,6 @@ void main() {
     final host = await found.future.timeout(const Duration(seconds: 3));
     expect(host.name, 'Dynamic test host');
     expect(host.address, InternetAddress.loopbackIPv4.address);
-    expect(host.invitation, 'sonara1:device-test');
+    expect(host.invitation, invitation);
   });
 }

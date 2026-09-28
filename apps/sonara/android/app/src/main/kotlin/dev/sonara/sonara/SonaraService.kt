@@ -12,6 +12,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
@@ -50,7 +51,7 @@ class SonaraService : Service() {
         autoReconnect = intent.getBooleanExtra(MainActivity.EXTRA_AUTO_RECONNECT, true)
         reconnectDeadlineMs = System.currentTimeMillis() + 60_000L
         retryIndex = 0
-        nativeStart(invitation)
+        nativeStart(invitation, deviceDisplayName())
         beginStatusPolling()
         return START_NOT_STICKY
     }
@@ -65,6 +66,7 @@ class SonaraService : Service() {
         wakeLock?.takeIf { it.isHeld }?.release()
         wakeLock = null
         activeHostFingerprint = null
+        markStopped()
         super.onDestroy()
     }
 
@@ -73,13 +75,18 @@ class SonaraService : Service() {
     private fun beginStatusPolling() {
         if (!polling.compareAndSet(false, true)) return
         statusThread = Thread({
+            var notificationState = ""
+            var telemetryTick = 0
             while (polling.get()) {
                 lastStatus = platformStatus()
-                Log.i("SonaraReceiver", lastStatus)
                 val state = Regex("\\\"state\\\":\\\"([^\\\"]+)\\\"")
                     .find(lastStatus)?.groupValues?.get(1) ?: "receiving"
-                getSystemService(NotificationManager::class.java)
-                    .notify(NOTIFICATION_ID, notification("Receiver: $state"))
+                if (state != notificationState) {
+                    notificationState = state
+                    getSystemService(NotificationManager::class.java)
+                        .notify(NOTIFICATION_ID, notification("Receiver: $state"))
+                }
+                if (telemetryTick++ % 5 == 0) Log.i("SonaraReceiver", lastStatus)
                 if (state == "stopped") {
                     stopSelf()
                     break
@@ -113,11 +120,11 @@ class SonaraService : Service() {
                     } catch (_: InterruptedException) {
                         break
                     }
-                    nativeStart(invitation)
+                    nativeStart(invitation, deviceDisplayName())
                     continue
                 }
                 try {
-                    Thread.sleep(500)
+                    Thread.sleep(100)
                 } catch (_: InterruptedException) {
                     break
                 }
@@ -137,21 +144,31 @@ class SonaraService : Service() {
 
     @Suppress("DEPRECATION")
     private fun acquirePerformanceLocks() {
-        val wifi = applicationContext.getSystemService(WifiManager::class.java)
-        wifiLock = wifi.createWifiLock(
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-            "Sonara:low-latency-wifi",
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
+        try {
+            val wifi = applicationContext.getSystemService(WifiManager::class.java)
+            wifiLock = wifi.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "Sonara:low-latency-wifi",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (error: SecurityException) {
+            wifiLock = null
+            Log.w("SonaraReceiver", "Wi-Fi performance lock unavailable", error)
         }
-        val power = getSystemService(PowerManager::class.java)
-        wakeLock = power.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "Sonara:receiver-cpu",
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
+        try {
+            val power = getSystemService(PowerManager::class.java)
+            wakeLock = power.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "Sonara:receiver-cpu",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (error: SecurityException) {
+            wakeLock = null
+            Log.w("SonaraReceiver", "CPU wake lock unavailable", error)
         }
     }
 
@@ -159,6 +176,7 @@ class SonaraService : Service() {
         val status = JSONObject(nativeStatus())
         status.put("platform_manufacturer", Build.MANUFACTURER)
         status.put("platform_model", Build.MODEL)
+        status.put("device_name", deviceDisplayName())
         status.put("platform_sdk", Build.VERSION.SDK_INT)
         status.put("platform_abis", JSONArray(Build.SUPPORTED_ABIS.toList()))
 
@@ -179,6 +197,25 @@ class SonaraService : Service() {
             JSONArray(routes.map { "${it.productName} (${routeType(it.type)})" }),
         )
         return status.toString()
+    }
+
+    private fun deviceDisplayName(): String {
+        val configured = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
+            Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME)?.trim()
+        } else {
+            null
+        }
+        val manufacturer = Build.MANUFACTURER.trim().replaceFirstChar {
+            if (it.isLowerCase()) it.titlecase() else it.toString()
+        }
+        val model = Build.MODEL.trim()
+        val base = configured?.takeIf { it.isNotEmpty() } ?: model
+        return when {
+            base.isEmpty() -> "Android device"
+            manufacturer.isEmpty() -> base
+            base.startsWith(manufacturer, ignoreCase = true) -> base
+            else -> "$manufacturer $base"
+        }
     }
 
     private fun routeType(type: Int): String = when (type) {
@@ -239,12 +276,28 @@ class SonaraService : Service() {
         var activeHostFingerprint: String? = null
             private set
 
+        fun markStopping() {
+            markState("stopping")
+        }
+
+        fun markStopped() {
+            markState("stopped")
+        }
+
+        private fun markState(state: String) {
+            lastStatus = try {
+                JSONObject(lastStatus).put("state", state).toString()
+            } catch (_: Exception) {
+                "{\"state\":\"$state\"}"
+            }
+        }
+
         init {
             System.loadLibrary("sonara_audio")
             System.loadLibrary("sonara_android")
         }
 
-        @JvmStatic private external fun nativeStart(invitation: String): Boolean
+        @JvmStatic private external fun nativeStart(invitation: String, receiverName: String): Boolean
         @JvmStatic private external fun nativeStop()
         @JvmStatic private external fun nativeStatus(): String
     }

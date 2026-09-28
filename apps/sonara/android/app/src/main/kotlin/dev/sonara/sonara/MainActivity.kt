@@ -1,11 +1,23 @@
 package dev.sonara.sonara
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.NetworkInterface
+import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
@@ -28,9 +40,13 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                     "stop" -> {
+                        SonaraService.markStopping()
                         stopService(Intent(this, SonaraService::class.java))
+                        SonaraService.markStopped()
                         result.success(true)
                     }
+                    "ensureLocalNetworkAccess" -> ensureLocalNetworkAccess(result)
+                    "scanLocalNetwork" -> scanLocalNetwork(result)
                     "status" -> result.success(SonaraService.lastStatus)
                     "trustState" -> result.success(
                         mapOf(
@@ -63,10 +79,137 @@ class MainActivity : FlutterActivity() {
         intent.getStringExtra(EXTRA_INVITATION)?.let { startReceiver(it, false) }
     }
 
+    private fun scanLocalNetwork(result: MethodChannel.Result) {
+        if (!discoveryScanRunning.compareAndSet(false, true)) {
+            result.success(emptyList<Map<String, Any>>())
+            return
+        }
+        Thread({
+            val announcements = mutableListOf<Map<String, Any>>()
+            try {
+                DatagramSocket().use { socket ->
+                    socket.broadcast = true
+                    val probe = DISCOVERY_PROBE.toByteArray(Charsets.UTF_8)
+                    for (target in localProbeAddresses()) {
+                        val packet = DatagramPacket(
+                            probe,
+                            probe.size,
+                            InetAddress.getByName(target),
+                            DISCOVERY_PORT,
+                        )
+                        socket.send(packet)
+                    }
+
+                    val deadline = System.currentTimeMillis() + DISCOVERY_RESPONSE_WINDOW_MS
+                    val seen = mutableSetOf<String>()
+                    while (System.currentTimeMillis() < deadline) {
+                        socket.soTimeout = maxOf(
+                            1,
+                            (deadline - System.currentTimeMillis()).toInt(),
+                        )
+                        val buffer = ByteArray(4096)
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        try {
+                            socket.receive(packet)
+                        } catch (_: SocketTimeoutException) {
+                            break
+                        }
+                        val data = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
+                        val key = "${packet.address.hostAddress}:${data.contentHashCode()}"
+                        if (seen.add(key)) {
+                            announcements.add(
+                                mapOf(
+                                    "address" to packet.address.hostAddress,
+                                    "data" to data,
+                                ),
+                            )
+                        }
+                    }
+                }
+                runOnUiThread { result.success(announcements) }
+            } catch (error: Exception) {
+                Log.w("SonaraDiscovery", "Native LAN scan failed", error)
+                runOnUiThread {
+                    result.error("lan_scan", "Could not scan the local network", error.message)
+                }
+            } finally {
+                discoveryScanRunning.set(false)
+            }
+        }, "sonara-discovery").start()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         intent.getStringExtra(EXTRA_INVITATION)?.let { startReceiver(it, false) }
+    }
+
+    private fun ensureLocalNetworkAccess(result: MethodChannel.Result) {
+        // Android 16 uses NEARBY_WIFI_DEVICES while Local Network Protection is
+        // being introduced. Older releases grant LAN sockets through INTERNET.
+        val usesCompatibilityGrant = applicationInfo.targetSdkVersion < 36
+        val granted = Build.VERSION.SDK_INT < 36 || usesCompatibilityGrant ||
+            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!granted && !usesCompatibilityGrant) {
+            requestPermissions(
+                arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
+                REQUEST_LOCAL_NETWORK,
+            )
+        }
+        // Do not hold a platform-channel reply while an OEM permission UI is
+        // open. The periodic probe begins working as soon as access is granted.
+        result.success(
+            mapOf(
+                "granted" to granted,
+                "probe_addresses" to localProbeAddresses(),
+            ),
+        )
+    }
+
+    private fun localProbeAddresses(): List<String> {
+        val addresses = try {
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { networkInterface -> networkInterface.interfaceAddresses }
+                .flatMap { interfaceAddress ->
+                    val address = interfaceAddress.address
+                    val broadcast = interfaceAddress.broadcast
+                    if (address !is Inet4Address || broadcast !is Inet4Address) {
+                        return@flatMap emptyList()
+                    }
+                    val prefix = interfaceAddress.networkPrefixLength.toInt()
+                    if (prefix !in 1..30) return@flatMap listOf(broadcast.hostAddress)
+
+                    // A bounded unicast sweep handles Android/OEM stacks that
+                    // filter broadcasts. On very broad networks, start with the
+                    // device's own /24 rather than flooding the whole prefix.
+                    val scanPrefix = maxOf(prefix, 24)
+                    val addressBits = ByteBuffer.wrap(address.address).int.toLong() and 0xffffffffL
+                    val mask = (0xffffffffL shl (32 - scanPrefix)) and 0xffffffffL
+                    val networkBits = addressBits and mask
+                    val broadcastBits = networkBits or (mask.inv() and 0xffffffffL)
+                    buildList {
+                        add(broadcast.hostAddress)
+                        for (candidate in (networkBits + 1) until broadcastBits) {
+                            if (candidate == addressBits) continue
+                            add(
+                                InetAddress.getByAddress(
+                                    ByteBuffer.allocate(Int.SIZE_BYTES)
+                                        .putInt(candidate.toInt())
+                                        .array(),
+                                ).hostAddress,
+                            )
+                        }
+                    }
+                }
+                .distinct()
+        } catch (error: Exception) {
+            Log.w("SonaraDiscovery", "Could not enumerate local probe targets", error)
+            emptyList()
+        }
+        Log.i("SonaraDiscovery", "Local discovery targets: ${addresses.size}")
+        return addresses
     }
 
     private fun startReceiver(invitation: String, trust: Boolean) {
@@ -102,5 +245,10 @@ class MainActivity : FlutterActivity() {
         internal const val PREFERENCES = "sonara_trust"
         internal const val KEY_TRUSTED = "trusted_fingerprints"
         private const val KEY_AUTO_RECONNECT = "auto_reconnect"
+        private const val REQUEST_LOCAL_NETWORK = 4101
+        private const val DISCOVERY_PORT = 49_813
+        private const val DISCOVERY_PROBE = "SONARA_DISCOVER/1"
+        private const val DISCOVERY_RESPONSE_WINDOW_MS = 700L
+        private val discoveryScanRunning = AtomicBoolean(false)
     }
 }
