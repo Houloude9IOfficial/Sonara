@@ -17,7 +17,7 @@ Sonara currently targets:
 | --- | --- | --- |
 | Windows | Supported | Supported |
 | Android | Supported | Supported |
-| macOS | Planned | Release workflow activates when the macOS project is added |
+| macOS 14.2+ on Apple Silicon | Supported | Ad hoc signed GitHub DMG |
 
 Current Android application ID:
 
@@ -47,6 +47,7 @@ The build menu allows selecting:
 
 - Android
 - Windows
+- macOS on Apple Silicon
 - All supported platforms
 - Debug
 - Production
@@ -568,13 +569,7 @@ Current production release targets include:
 
 ## macOS
 
-The macOS lane will build a compressed disk image (`.dmg`) and its SHA-256 checksum after the Flutter macOS application exists at:
-
-```text
-apps/sonara/macos
-```
-
-The `.dmg` will be uploaded as its own release asset. Apple signing and notarization requirements should be addressed before distributing a production macOS build broadly.
+The macOS lane builds an Apple Silicon `.app` with its bundled Rust engine, signs the app and helper ad hoc, and packages a `.dmg` with a SHA-256 checksum. It does not use a Developer ID certificate or notarization. Users must approve first launch in **System Settings → Privacy & Security → Open Anyway** and grant System Audio Recording permission when prompted.
 
 ---
 
@@ -1013,26 +1008,15 @@ python .\build.py
 
 # macOS support
 
-macOS is planned as a future Sonara desktop target.
+On an Apple Silicon Mac with Xcode, Flutter, and Rust installed, run `python3 build.py --target macos --mode debug` for a development app or `python3 build.py --target macos --mode production` for a DMG. The Mac Xcode build compiles and bundles the Rust engine automatically. `python3 build.py --target all --mode debug` builds macOS and Android on a Mac; Windows and Android on Windows.
 
-The release workflow is structured so its macOS lane can activate after the Flutter macOS project is added at:
+You can also open `build.py` in Python IDLE and choose **2. macOS → 1. Production**. The launcher locates Flutter when IDLE starts with a minimal `PATH`. If your Flutter SDK is in a custom location, set `SONARA_FLUTTER_BIN` to the full path of its `bin/flutter` executable before launching the builder. The production DMG and its `.sha256` file appear in `dist/`.
 
-```text
-apps/sonara/macos
-```
+For Android builds on a Mac, accept Android SDK licenses with `flutter doctor --android-licenses`, install `cargo-ndk`, and install both Android Rust targets. Mac Android production packaging requires the existing approved `release-key.jks` and `key.properties`; it never generates a new signing key.
 
-A production macOS release will additionally need decisions around:
+The Mac release supports macOS 14.2+ and arm64 only. System audio capture uses Core Audio process taps and asks for System Audio Recording permission. Unsigned updates may prompt again for capture permission. If Developer ID signing and notarization are added later, retest first launch, update behavior, and capture permission identity.
 
-- Apple Developer signing
-- Developer ID certificates
-- Hardened Runtime
-- notarization
-- entitlements
-- installer or DMG packaging
-- update compatibility
-- GitHub Actions macOS runners
-
-Do not publish unsigned production macOS packages as official Sonara builds once formal distribution begins.
+Current Flutter stable releases can crash while generating macOS AOT code for unused experimental windowing structs ([Flutter issue #191575](https://github.com/flutter/flutter/issues/191575)). `build-macos.sh` temporarily disables that experimental SDK feature for its Release build and restores the Flutter SDK afterward. Remove the workaround when Flutter fixes the compiler issue.
 
 ---
 

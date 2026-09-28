@@ -17,6 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 APP = ROOT / "apps" / "sonara"
 RELEASE_SCRIPT = ROOT / "tools" / "packaging" / "build-release.ps1"
+MAC_RELEASE_SCRIPT = ROOT / "tools" / "packaging" / "build-macos.sh"
+ANDROID_RELEASE_SCRIPT = ROOT / "tools" / "packaging" / "build-android.py"
 OUTPUT_LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
 ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
@@ -48,10 +50,39 @@ def powershell() -> str:
     return executable
 
 
+def flutter_executable() -> str:
+    """Find Flutter even when a GUI-launched Python has a minimal PATH."""
+    candidates: list[Path] = []
+    for name in ("SONARA_FLUTTER_BIN", "FLUTTER_BIN"):
+        if value := os.environ.get(name):
+            candidates.append(Path(value).expanduser())
+    for name in ("FLUTTER_ROOT", "FLUTTER_HOME"):
+        if value := os.environ.get(name):
+            candidates.append(Path(value).expanduser() / "bin" / "flutter")
+    for name in ("flutter.bat", "flutter"):
+        if value := shutil.which(name):
+            candidates.append(Path(value))
+    candidates.extend(
+        [
+            ROOT / ".fvm" / "flutter_sdk" / "bin" / "flutter",
+            Path.home() / "Documents" / "workapps" / "flutter" / "bin" / "flutter",
+            Path.home() / "development" / "flutter" / "bin" / "flutter",
+            Path.home() / "flutter" / "bin" / "flutter",
+            Path("/opt/homebrew/bin/flutter"),
+            Path("/usr/local/bin/flutter"),
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+    raise RuntimeError(
+        "Flutter was not found. Set SONARA_FLUTTER_BIN to the full path of "
+        "your Flutter executable, or add Flutter's bin directory to PATH."
+    )
+
+
 def flutter_command(*arguments: str) -> tuple[str, ...]:
-    executable = shutil.which("flutter.bat") or shutil.which("flutter")
-    if executable is None:
-        raise RuntimeError("Flutter was not found on PATH")
+    executable = flutter_executable()
     if os.name == "nt" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
         command_processor = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
         return (command_processor, "/d", "/c", executable, *arguments)
@@ -62,8 +93,14 @@ def jobs_for(target: str, mode: str) -> list[BuildJob]:
     release = mode == "production"
     app_version = version()
     jobs: list[BuildJob] = []
+    if target == "all":
+        targets = {"android", "windows"} if os.name == "nt" else (
+            {"android", "macos"} if sys.platform == "darwin" else {"android"}
+        )
+    else:
+        targets = {target}
 
-    if target in {"windows", "all"}:
+    if "windows" in targets:
         if release:
             command = (
                 powershell(),
@@ -86,17 +123,20 @@ def jobs_for(target: str, mode: str) -> list[BuildJob]:
             )
         jobs.append(BuildJob("Windows", command, ROOT if release else APP, results))
 
-    if target in {"android", "all"}:
+    if "macos" in targets:
+        if release:
+            command = ("bash", str(MAC_RELEASE_SCRIPT))
+            results = (ROOT / "dist" / f"Sonara-{app_version}-macos-arm64.dmg",)
+        else:
+            command = flutter_command("build", "macos", "--debug")
+            results = (APP / "build" / "macos" / "Build" / "Products" / "Debug" / "sonara.app",)
+        jobs.append(BuildJob("macOS", command, ROOT if release else APP, results))
+
+    if "android" in targets:
         if release:
             command = (
-                powershell(),
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(RELEASE_SCRIPT),
-                "-Platform",
-                "Android",
+                (powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(RELEASE_SCRIPT), "-Platform", "Android")
+                if os.name == "nt" else (sys.executable, str(ANDROID_RELEASE_SCRIPT))
             )
             results = (ROOT / "dist" / f"Sonara-{app_version}-android.apk",)
         else:
@@ -122,7 +162,12 @@ def run_job(job: BuildJob, dry_run: bool = False) -> int:
 
     environment = os.environ.copy()
     cargo_bin = Path.home() / ".cargo" / "bin"
-    environment["PATH"] = f"{cargo_bin}{os.pathsep}{environment.get('PATH', '')}"
+    flutter_bin = Path(flutter_executable()).parent
+    python_bin = Path(sys.executable).resolve().parent
+    environment["PATH"] = os.pathsep.join(
+        (str(flutter_bin), str(cargo_bin), str(python_bin), environment.get("PATH", ""))
+    )
+    environment["SONARA_PYTHON"] = sys.executable
     process = subprocess.Popen(
         job.command,
         cwd=job.cwd,
@@ -162,34 +207,18 @@ def stop_active_processes() -> None:
 def run_build(target: str, mode: str, dry_run: bool = False) -> bool:
     jobs = jobs_for(target, mode)
     outcomes: dict[str, int] = {}
-    threads: list[threading.Thread] = []
-
-    def worker(job: BuildJob) -> None:
-        try:
-            outcomes[job.channel] = run_job(job, dry_run=dry_run)
-        except Exception as error:
-            channel_print(job.channel, f"Build process could not start: {error}")
-            outcomes[job.channel] = 1
-
-    for job in jobs:
-        thread = threading.Thread(
-            target=worker,
-            args=(job,),
-            name=f"sonara-{job.channel.lower()}-build",
-            daemon=True,
-        )
-        thread.start()
-        threads.append(thread)
-
     try:
-        while any(thread.is_alive() for thread in threads):
-            for thread in threads:
-                thread.join(timeout=0.1)
+        # Both platforms share one Flutter checkout. Run "all" in sequence so
+        # macOS AOT's temporary SDK workaround cannot overlap Android's build.
+        for job in jobs:
+            try:
+                outcomes[job.channel] = run_job(job, dry_run=dry_run)
+            except Exception as error:
+                channel_print(job.channel, f"Build process could not start: {error}")
+                outcomes[job.channel] = 1
     except KeyboardInterrupt:
         print("\nStopping active builds…", flush=True)
         stop_active_processes()
-        for thread in threads:
-            thread.join(timeout=6)
         return False
 
     print("\nBuild results")
@@ -203,9 +232,9 @@ def run_build(target: str, mode: str, dry_run: bool = False) -> bool:
             continue
         print(f"{job.channel}: OK")
         for result in job.results:
-            state = "created" if result.is_file() else "missing"
+            state = "created" if result.exists() else "missing"
             print(f"  {result.resolve()} [{state}]")
-            success = success and (dry_run or result.is_file())
+            success = success and (dry_run or result.exists())
     print("-" * 72)
     return success
 
@@ -235,7 +264,9 @@ def interactive() -> int:
         try:
             target = choose(
                 "What should be built?",
-                {"1": "Android", "2": "Windows", "3": "All"},
+                ({"1": "Android", "2": "Windows", "3": "All"}
+                 if os.name == "nt" else
+                 {"1": "Android", "2": "macOS", "3": "All"}),
             )
             mode = choose(
                 "Which build type?",
@@ -245,7 +276,8 @@ def interactive() -> int:
             if mode is None:
                 continue
             assert target is not None
-            print(f"\nBuilding {target.title()} ({mode})…")
+            display_target = "macOS" if target == "macos" else target.title()
+            print(f"\nBuilding {display_target} ({mode})…")
             run_build(target, mode)
             input("\nPress Enter to return to the build menu…")
         except EOFError:
@@ -262,7 +294,7 @@ def interactive() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build Sonara packages")
-    parser.add_argument("--target", choices=("android", "windows", "all"))
+    parser.add_argument("--target", choices=("android", "windows", "macos", "all"))
     parser.add_argument("--mode", choices=("production", "debug"))
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()

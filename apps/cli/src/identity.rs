@@ -16,9 +16,45 @@ pub fn load_or_create() -> Result<IdentityMaterial> {
     {
         load_or_create_windows()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        load_or_create_macos()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         generate(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn load_or_create_macos() -> Result<IdentityMaterial> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::env::var_os("SONARA_IDENTITY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                .join("Library/Application Support/Sonara/identity")
+        });
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let certificate_path = directory.join("device-certificate.der");
+    let key_path = directory.join("device-key.der");
+    match (certificate_path.exists(), key_path.exists()) {
+        (true, true) => Ok(IdentityMaterial {
+            certificate_der: fs::read(&certificate_path)?,
+            private_key_der: fs::read(&key_path)?,
+            persistent: true,
+        }),
+        (false, false) => {
+            let material = generate(true)?;
+            write_new(&key_path, &material.private_key_der)?;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+            write_new(&certificate_path, &material.certificate_der)?;
+            fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o600))?;
+            Ok(material)
+        }
+        _ => bail!("incomplete device identity in {}", directory.display()),
     }
 }
 
@@ -76,11 +112,15 @@ fn identity_directory() -> Result<PathBuf> {
     Ok(PathBuf::from(local).join("Sonara").join("identity"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     let mut file = options
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;

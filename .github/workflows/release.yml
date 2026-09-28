@@ -33,6 +33,15 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check pillow
           choco install innosetup --yes --no-progress
+      - name: Check Windows host and shared UI
+        shell: pwsh
+        run: |
+          cargo test --workspace
+          Push-Location apps/sonara
+          flutter pub get
+          flutter analyze
+          flutter test
+          Pop-Location
       - name: Build and package
         shell: pwsh
         run: ./tools/packaging/build-release.ps1 -Platform Windows
@@ -113,55 +122,34 @@ jobs:
             dist/Sonara-*-android.apk.sha256
 
   macos:
-    name: macOS production (ready when project is added)
-    runs-on: macos-latest
+    name: macOS Apple Silicon production
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Detect macOS project
-        id: project
-        shell: bash
-        run: |
-          if [[ -d apps/sonara/macos ]]; then
-            echo 'available=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'available=false' >> "$GITHUB_OUTPUT"
-            echo 'macOS project is not present yet; this lane will activate automatically once it is added.'
-          fi
       - uses: subosito/flutter-action@v2
-        if: steps.project.outputs.available == 'true'
         with:
           channel: stable
           cache: true
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.project.outputs.available == 'true'
-      - name: Build and package
-        if: steps.project.outputs.available == 'true'
-        working-directory: apps/sonara
-        shell: bash
+        with:
+          targets: aarch64-apple-darwin
+      - name: Check Flutter UI and Rust host
         run: |
+          cargo test --workspace
+          cd apps/sonara
           flutter pub get
-          flutter build macos --release
-          version="$(sed -nE 's/^version: *([^+ ]+).*/\1/p' pubspec.yaml | head -1)"
-          mkdir -p ../../dist
-          app_path="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
-          test -n "$app_path"
-          hdiutil create \
-            -volname Sonara \
-            -srcfolder "$app_path" \
-            -ov \
-            -format UDZO \
-            "../../dist/Sonara-${version}-macos.dmg"
-          cd ../../dist
-          shasum -a 256 "Sonara-${version}-macos.dmg" > \
-            "Sonara-${version}-macos.dmg.sha256"
+          flutter analyze
+          flutter test
+      - name: Build and package
+        shell: bash
+        run: bash tools/packaging/build-macos.sh
       - uses: actions/upload-artifact@v4
-        if: steps.project.outputs.available == 'true'
         with:
           name: Sonara-macOS-Installer-DMG
           if-no-files-found: error
           path: |
-            dist/Sonara-*-macos.dmg
-            dist/Sonara-*-macos.dmg.sha256
+            dist/Sonara-*-macos-arm64.dmg
+            dist/Sonara-*-macos-arm64.dmg.sha256
 
   publish:
     name: Attach production builds to release

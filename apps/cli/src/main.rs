@@ -46,6 +46,9 @@ enum Command {
         /// Capture all audible Windows applications, excluding Sonara itself.
         #[arg(long, conflicts_with_all = ["pid", "test_tone"])]
         system_audio: bool,
+        /// macOS PCM input socket supplied by the Flutter host.
+        #[arg(long, conflicts_with_all = ["pid", "test_tone", "system_audio"])]
+        mac_pcm_socket: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:49812")]
         listen: SocketAddr,
         /// Address placed in the invitation. Repeat for every reachable host interface.
@@ -251,6 +254,7 @@ async fn main() -> Result<()> {
             pid,
             test_tone,
             system_audio,
+            mac_pcm_socket,
             listen,
             advertise,
             duration,
@@ -264,9 +268,10 @@ async fn main() -> Result<()> {
             eprintln!("mode={mode:?}, profile={profile:?}");
             let tuning = host_tuning(&mode, &profile);
             let source_count =
-                usize::from(pid.is_some()) + usize::from(test_tone) + usize::from(system_audio);
+                usize::from(pid.is_some()) + usize::from(test_tone) + usize::from(system_audio)
+                    + usize::from(mac_pcm_socket.is_some());
             if source_count != 1 {
-                bail!("choose exactly one source: --pid, --system-audio, or --test-tone");
+                bail!("choose exactly one host audio source");
             }
             if test_tone {
                 network::host_test_tone(
@@ -277,6 +282,19 @@ async fn main() -> Result<()> {
                     tuning,
                 )
                 .await?;
+            } else if let Some(socket) = mac_pcm_socket {
+                #[cfg(target_os = "macos")]
+                network::host_mac_pcm(
+                    socket,
+                    listen,
+                    advertise,
+                    Duration::from_secs_f64(duration),
+                    &invitation_out,
+                    tuning,
+                )
+                .await?;
+                #[cfg(not(target_os = "macos"))]
+                bail!("macOS PCM hosting is available on macOS only");
             } else if system_audio {
                 #[cfg(windows)]
                 network::host_system(
@@ -359,7 +377,10 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             #[cfg(not(windows))]
-            bail!("process-loopback capture is available on Windows only");
+            {
+                let _ = (pid, output);
+                bail!("process-loopback capture is available on Windows only");
+            }
         }
         Command::Dev {
             command:

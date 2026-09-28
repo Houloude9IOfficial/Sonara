@@ -6,6 +6,8 @@ import 'dart:io'
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'discovery.dart';
 
@@ -13,6 +15,13 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const SonaraApp());
 }
+
+bool get isDesktopHost =>
+    defaultTargetPlatform == TargetPlatform.windows ||
+    defaultTargetPlatform == TargetPlatform.macOS;
+
+String get hostPlatformName =>
+    defaultTargetPlatform == TargetPlatform.macOS ? 'Mac' : 'Windows';
 
 const ink = Color(0xFF17202A),
     indigo = Color(0xFF4057C8),
@@ -118,7 +127,8 @@ class _SonaraShellState extends State<SonaraShell> {
   bool receiverBusy = false;
   bool statusRefreshInFlight = false;
   bool sourcesLoading = false;
-  bool startWithWindows = false;
+  bool startWithDesktop = false;
+  String? appVersion;
   int? selectedSourcePid;
   List<AppSource> sources = const [];
   Map<String, dynamic> hostStatus = const {};
@@ -159,6 +169,7 @@ class _SonaraShellState extends State<SonaraShell> {
   @override
   void initState() {
     super.initState();
+    unawaited(loadAppVersion());
     if (defaultTargetPlatform == TargetPlatform.android) {
       statusTimer = Timer.periodic(
         const Duration(milliseconds: 100),
@@ -169,7 +180,7 @@ class _SonaraShellState extends State<SonaraShell> {
         refreshTrustState();
         unawaited(startDiscovery());
       }
-    } else if (defaultTargetPlatform == TargetPlatform.windows) {
+    } else if (isDesktopHost) {
       refreshSources();
       refreshHostStatus();
       refreshStartupSetting();
@@ -177,6 +188,15 @@ class _SonaraShellState extends State<SonaraShell> {
         const Duration(milliseconds: 100),
         (_) => refreshHostStatus(),
       );
+    }
+  }
+
+  Future<void> loadAppVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (mounted) setState(() => appVersion = info.version);
+    } catch (_) {
+      // Package metadata may be unavailable in widget tests.
     }
   }
 
@@ -408,9 +428,7 @@ class _SonaraShellState extends State<SonaraShell> {
     final report = <String, dynamic>{
       'generated_at': DateTime.now().toUtc().toIso8601String(),
       'platform': defaultTargetPlatform.name,
-      'session': defaultTargetPlatform == TargetPlatform.windows
-          ? hostStatus
-          : receiverStatus,
+      'session': isDesktopHost ? hostStatus : receiverStatus,
       'trusted_host_count': trustedFingerprints.length,
       'auto_reconnect': autoReconnect,
     };
@@ -424,7 +442,7 @@ class _SonaraShellState extends State<SonaraShell> {
   }
 
   String get timingConfidence {
-    if (defaultTargetPlatform == TargetPlatform.windows) {
+    if (isDesktopHost) {
       return streaming ? 'Awaiting receiver measurements' : 'Not measured';
     }
     if (receiverState != 'playing') return 'Not measured';
@@ -437,7 +455,7 @@ class _SonaraShellState extends State<SonaraShell> {
   }
 
   String get timingExplanation {
-    if (defaultTargetPlatform == TargetPlatform.windows) {
+    if (isDesktopHost) {
       return 'Receivers share one timestamped presentation timeline. Acoustic measurement is required to qualify speaker-to-speaker alignment.';
     }
     final route = receiverStatus['output_route_type'] as String? ?? 'output';
@@ -536,7 +554,7 @@ class _SonaraShellState extends State<SonaraShell> {
         }
       });
     } catch (_) {
-      // Widget tests and non-Windows builds do not register this channel.
+      // Widget tests and unsupported platforms do not register this channel.
     } finally {
       if (mounted) setState(() => sourcesLoading = false);
     }
@@ -554,10 +572,14 @@ class _SonaraShellState extends State<SonaraShell> {
       setState(() {
         hostStatus = status;
         streaming = status['active'] == true;
-        if (streaming) hostError = null;
+        if (streaming) {
+          hostError = null;
+        } else if ((status['error'] as String? ?? '').isNotEmpty) {
+          hostError = status['error'] as String;
+        }
       });
     } catch (_) {
-      // The native host is Windows-only.
+      // Widget tests and unsupported platforms do not register this channel.
     } finally {
       statusRefreshInFlight = false;
     }
@@ -567,7 +589,7 @@ class _SonaraShellState extends State<SonaraShell> {
     try {
       final enabled = await hostChannel.invokeMethod<bool>('getStartup');
       if (mounted && enabled != null) {
-        setState(() => startWithWindows = enabled);
+        setState(() => startWithDesktop = enabled);
       }
     } catch (_) {}
   }
@@ -577,7 +599,7 @@ class _SonaraShellState extends State<SonaraShell> {
       final applied = await hostChannel.invokeMethod<bool>('setStartup', {
         'enabled': enabled,
       });
-      if (mounted) setState(() => startWithWindows = applied ?? false);
+      if (mounted) setState(() => startWithDesktop = applied ?? false);
     } on PlatformException catch (error) {
       showError(error.message ?? 'Could not update startup settings');
     }
@@ -650,6 +672,18 @@ class _SonaraShellState extends State<SonaraShell> {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> openRepository() async {
+    try {
+      final opened = await launchUrl(
+        Uri.parse('https://github.com/Houloude9IOfficial/Sonara'),
+        mode: LaunchMode.externalApplication,
+      );
+      if (!opened) showError('Could not open the repository.');
+    } catch (_) {
+      showError('Could not open the repository.');
+    }
   }
 
   Future<void> copyInvitation() async {
@@ -752,7 +786,7 @@ class _SonaraShellState extends State<SonaraShell> {
         return 'Audio continues in the background until stopped.';
       }
       if (discoveredHosts.isEmpty) {
-        return 'Looking for Sonara PCs on this network.';
+        return 'Looking for Sonara hosts on this network.';
       }
       return 'Ready to connect securely.';
     }
@@ -799,7 +833,7 @@ class _SonaraShellState extends State<SonaraShell> {
             ),
             subtitle: Text(
               discoveryError ??
-                  'Keep Sonara open on the PC and use the same Wi-Fi, Ethernet, or tethered LAN.',
+                  'Keep Sonara open on the host and use the same Wi-Fi, Ethernet, or tethered LAN.',
             ),
           )
         else
@@ -845,8 +879,8 @@ class _SonaraShellState extends State<SonaraShell> {
             children: [
               Text(
                 receiverConnected
-                    ? 'Connected to ${connectedHostName ?? 'Sonara PC'}'
-                    : 'Connecting to ${connectedHostName ?? 'Sonara PC'}…',
+                    ? 'Connected to ${connectedHostName ?? 'Sonara host'}'
+                    : 'Connecting to ${connectedHostName ?? 'Sonara host'}…',
                 style: Theme.of(context).textTheme.titleMedium,
               ),
               const SizedBox(height: 3),
@@ -1023,12 +1057,12 @@ class _SonaraShellState extends State<SonaraShell> {
     children: [
       Heading(
         'Session',
-        defaultTargetPlatform == TargetPlatform.windows
+        isDesktopHost
             ? 'Choose an application and open a synchronized LAN session.'
-            : 'Connect this device to a nearby Sonara PC.',
+            : 'Connect this device to a nearby Sonara host.',
       ),
       const SizedBox(height: 22),
-      if (defaultTargetPlatform == TargetPlatform.windows) ...[
+      if (isDesktopHost) ...[
         Panel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1056,7 +1090,7 @@ class _SonaraShellState extends State<SonaraShell> {
                     DropdownMenuItem(
                       value: source.pid.toString(),
                       child: Text(
-                        '${source.name} — ${source.title}',
+                        '${source.name} (${source.title})',
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
@@ -1101,12 +1135,11 @@ class _SonaraShellState extends State<SonaraShell> {
             Row(
               children: [
                 const Expanded(child: Label('OUTPUTS')),
-                if (defaultTargetPlatform == TargetPlatform.windows &&
-                    streaming)
+                if (isDesktopHost && streaming)
                   Chip(label: Text('${hostStatus['address'] ?? 'LAN'}:49812')),
               ],
             ),
-            if (defaultTargetPlatform == TargetPlatform.windows) ...[
+            if (isDesktopHost) ...[
               const Divider(height: 24),
               if (connectedDevices.isEmpty)
                 ListTile(
@@ -1121,7 +1154,7 @@ class _SonaraShellState extends State<SonaraShell> {
                   ),
                   subtitle: Text(
                     streaming
-                        ? 'Nearby Android devices can discover this PC automatically.'
+                        ? 'Nearby Android devices can discover this host automatically.'
                         : 'Start the session to accept mobile listeners.',
                   ),
                   trailing: StatusPill(
@@ -1135,7 +1168,7 @@ class _SonaraShellState extends State<SonaraShell> {
                     contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.phone_android_rounded),
                     title: Text(device),
-                    subtitle: const Text('Receiving audio from this PC'),
+                    subtitle: const Text('Receiving audio from this host'),
                     trailing: const StatusPill(
                       label: 'CONNECTED',
                       active: true,
@@ -1192,7 +1225,7 @@ class _SonaraShellState extends State<SonaraShell> {
           ],
         ),
       ),
-      if (defaultTargetPlatform == TargetPlatform.windows) ...[
+      if (isDesktopHost) ...[
         const SizedBox(height: 16),
         Panel(
           child: Column(
@@ -1264,9 +1297,9 @@ class _SonaraShellState extends State<SonaraShell> {
             subtitle: Text(
               receiverStatus['error'] as String? ??
                   (receiverConnected
-                      ? 'Connected to Sonara PC · ${receiverStatus['output_route'] ?? 'Platform output'}'
+                      ? 'Connected to Sonara host · ${receiverStatus['output_route'] ?? 'Platform output'}'
                       : receiverActive
-                      ? 'Connecting to Sonara PC…'
+                      ? 'Connecting to Sonara host…'
                       : 'Not connected'),
             ),
             trailing: receiverActive
@@ -1286,7 +1319,7 @@ class _SonaraShellState extends State<SonaraShell> {
         const SizedBox(height: 14),
         if (receiverActive) receiverConnectionPanel() else nearbyHostsPanel(),
         const SizedBox(height: 14),
-      ] else if (defaultTargetPlatform == TargetPlatform.windows) ...[
+      ] else if (isDesktopHost) ...[
         Card(
           child: Column(
             children: [
@@ -1295,7 +1328,9 @@ class _SonaraShellState extends State<SonaraShell> {
                   streaming ? Icons.wifi_tethering : Icons.wifi_off,
                 ),
                 title: Text(
-                  streaming ? 'Windows host active' : 'Windows host idle',
+                  streaming
+                      ? '$hostPlatformName host active'
+                      : '$hostPlatformName host idle',
                 ),
                 subtitle: Text(
                   streaming
@@ -1344,25 +1379,19 @@ class _SonaraShellState extends State<SonaraShell> {
                   ),
                   leading: CircleAvatar(
                     child: Icon(
-                      defaultTargetPlatform == TargetPlatform.windows
+                      isDesktopHost
                           ? Icons.computer_outlined
                           : Icons.phone_android,
                     ),
                   ),
                   title: Text(o.name),
                   subtitle: Text('${o.route} · ${o.quality}'),
-                  trailing: Chip(
-                    label: Text(
-                      defaultTargetPlatform == TargetPlatform.windows
-                          ? 'Host'
-                          : 'Local',
-                    ),
-                  ),
+                  trailing: Chip(label: Text(isDesktopHost ? 'Host' : 'Local')),
                 ),
             ],
           ),
         ),
-      if (defaultTargetPlatform == TargetPlatform.windows) ...[
+      if (isDesktopHost) ...[
         const SizedBox(height: 18),
         OutlinedButton.icon(
           onPressed: streaming ? copyInvitation : null,
@@ -1377,7 +1406,7 @@ class _SonaraShellState extends State<SonaraShell> {
   );
 
   List<DiagnosticDatum> get diagnosticItems {
-    if (defaultTargetPlatform == TargetPlatform.windows) {
+    if (isDesktopHost) {
       return [
         DiagnosticDatum(
           'Session',
@@ -1509,8 +1538,8 @@ class _SonaraShellState extends State<SonaraShell> {
             Expanded(
               child: Text(
                 streaming || receiverActive
-                    ? 'Live telemetry · 10t/s'
-                    : 'Live telemetry · offline',
+                    ? 'Live telemetry'
+                    : 'Live telemetry',
                 style: const TextStyle(fontWeight: FontWeight.w600),
               ),
             ),
@@ -1567,16 +1596,20 @@ class _SonaraShellState extends State<SonaraShell> {
                 onChanged: setAutoReconnect,
                 title: const Text('Reconnect to trusted hosts'),
                 subtitle: const Text(
-                  'Connect automatically when an approved PC returns to this network',
+                  'Connect automatically when an approved host returns to this network',
                 ),
               ),
-            if (defaultTargetPlatform == TargetPlatform.windows)
+            if (isDesktopHost)
               SwitchListTile(
-                value: startWithWindows,
+                value: startWithDesktop,
                 onChanged: setStartup,
-                title: const Text('Start with Windows'),
-                subtitle: const Text(
-                  'Open Sonara in the notification area after sign-in',
+                title: Text(
+                  'Start with ${defaultTargetPlatform == TargetPlatform.macOS ? 'macOS' : 'Windows'}',
+                ),
+                subtitle: Text(
+                  defaultTargetPlatform == TargetPlatform.macOS
+                      ? 'Open Sonara in the menu bar after sign-in'
+                      : 'Open Sonara in the notification area after sign-in',
                 ),
               ),
             if (defaultTargetPlatform == TargetPlatform.android &&
@@ -1585,14 +1618,14 @@ class _SonaraShellState extends State<SonaraShell> {
               for (final fingerprint in trustedFingerprints)
                 ListTile(
                   leading: const Icon(Icons.verified_user_outlined),
-                  title: const Text('Trusted PC'),
+                  title: const Text('Trusted host'),
                   subtitle: Text(
                     fingerprint.length > 16
                         ? '${fingerprint.substring(0, 8)}…${fingerprint.substring(fingerprint.length - 8)}'
                         : fingerprint,
                   ),
                   trailing: IconButton(
-                    tooltip: 'Forget this PC',
+                    tooltip: 'Forget this host',
                     onPressed: () => forgetTrusted(fingerprint),
                     icon: const Icon(Icons.delete_outline),
                   ),
@@ -1602,9 +1635,9 @@ class _SonaraShellState extends State<SonaraShell> {
                 trustedFingerprints.isEmpty)
               const ListTile(
                 leading: Icon(Icons.devices_outlined),
-                title: Text('No trusted PCs yet'),
+                title: Text('No trusted hosts yet'),
                 subtitle: Text(
-                  'A PC becomes trusted after you connect to it manually.',
+                  'A host becomes trusted after you connect to it manually.',
                 ),
               ),
           ],
@@ -1636,7 +1669,11 @@ class _SonaraShellState extends State<SonaraShell> {
                 ),
               ),
               title: const Text('Sonara'),
-              subtitle: const Text('Version 1.0.0 · Open source under MIT'),
+              subtitle: Text(
+                appVersion == null
+                    ? 'Open source under MIT'
+                    : 'Version $appVersion · Open source under MIT',
+              ),
             ),
             const Divider(height: 1),
             const Padding(
@@ -1660,27 +1697,32 @@ class _SonaraShellState extends State<SonaraShell> {
                 ],
               ),
             ),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                onPressed: () => showLicensePage(
-                  context: context,
-                  applicationName: 'Sonara',
-                  applicationVersion: '1.0.0',
-                  applicationLegalese:
-                      '© 2026 Sonara contributors · MIT License',
-                  applicationIcon: ClipRRect(
-                    borderRadius: BorderRadius.circular(9),
-                    child: Image.asset(
-                      'assets/branding/app_mark.png',
-                      width: 44,
-                      height: 44,
+            Column(
+              children: [
+                TextButton.icon(
+                  onPressed: () => showLicensePage(
+                    context: context,
+                    applicationName: 'Sonara',
+                    applicationVersion: appVersion,
+                    applicationLegalese: '© 2026 CrickDevs · MIT License',
+                    applicationIcon: ClipRRect(
+                      borderRadius: BorderRadius.circular(9),
+                      child: Image.asset(
+                        'assets/branding/app_mark.png',
+                        width: 44,
+                        height: 44,
+                      ),
                     ),
                   ),
+                  icon: const Icon(Icons.article_outlined),
+                  label: const Text('Open-source licenses'),
                 ),
-                icon: const Icon(Icons.article_outlined),
-                label: const Text('Open-source licenses'),
-              ),
+                TextButton.icon(
+                  onPressed: openRepository,
+                  icon: const Icon(Icons.open_in_new),
+                  label: const Text('Repository'),
+                ),
+              ],
             ),
           ],
         ),

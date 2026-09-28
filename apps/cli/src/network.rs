@@ -25,6 +25,8 @@ use tokio::{
     net::UdpSocket,
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
+#[cfg(target_os = "macos")]
+use tokio::{io::AsyncReadExt, net::UnixListener, sync::broadcast};
 use uuid::Uuid;
 
 const ALPN: &[u8] = b"sonara/1";
@@ -65,13 +67,21 @@ impl InvitationState {
     }
 }
 
-#[derive(Clone, Copy)]
 enum HostSource {
     Tone,
     #[cfg(windows)]
     Process(u32),
     #[cfg(windows)]
     System,
+    #[cfg(target_os = "macos")]
+    MacPcm(broadcast::Receiver<MacPcmBlock>),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct MacPcmBlock {
+    timestamp_ns: u64,
+    pcm: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,7 +173,8 @@ async fn advertise_invitation(state: Arc<Mutex<InvitationState>>) -> Result<()> 
     socket
         .set_broadcast(true)
         .context("enabling LAN discovery broadcast")?;
-    let host_name = std::env::var("COMPUTERNAME")
+    let host_name = std::env::var("SONARA_HOST_NAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "Sonara host".to_owned());
@@ -254,6 +265,52 @@ pub async fn host_test_tone(
     .await
 }
 
+#[cfg(target_os = "macos")]
+pub async fn host_mac_pcm(
+    socket_path: std::path::PathBuf,
+    listen: SocketAddr,
+    advertise: Vec<SocketAddr>,
+    duration: Duration,
+    invitation_out: &Path,
+    tuning: HostTuning,
+) -> Result<()> {
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("binding macOS audio socket {}", socket_path.display()))?;
+    let (sender, receiver) = broadcast::channel(32);
+    let reader = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        eprintln!("macOS PCM input connected");
+        loop {
+            let length = match stream.read_u32().await {
+                Ok(value) => value as usize,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            };
+            if length == 0 || length > 65_536 || length % 4 != 0 {
+                bail!("invalid macOS PCM block length {length}");
+            }
+            let timestamp_ns = stream.read_u64().await?;
+            let mut pcm = vec![0; length];
+            stream.read_exact(&mut pcm).await?;
+            let _ = sender.send(MacPcmBlock { timestamp_ns, pcm });
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let outcome = host_audio(
+        listen,
+        advertise,
+        duration,
+        invitation_out,
+        HostSource::MacPcm(receiver),
+        tuning,
+    )
+    .await;
+    reader.abort();
+    let _ = std::fs::remove_file(&socket_path);
+    outcome
+}
+
 #[cfg(windows)]
 pub async fn host_process(
     pid: u32,
@@ -335,7 +392,7 @@ async fn host_audio(
         "Listening on {local_addr}; invitation written to {}; identity={}",
         invitation_out.display(),
         if persistent_identity {
-            "os-protected"
+            "persistent"
         } else {
             "ephemeral"
         }
@@ -444,12 +501,14 @@ async fn host_audio(
         sleep(Duration::from_nanos(remaining_ns)).await;
     }
     let frame_count = tuning.frame_count;
-    let source_name = match source {
+    let source_name = match &source {
         HostSource::Tone => "generated 440 Hz tone".to_owned(),
         #[cfg(windows)]
         HostSource::Process(pid) => format!("WASAPI process tree {pid}"),
         #[cfg(windows)]
         HostSource::System => "WASAPI system audio".to_owned(),
+        #[cfg(target_os = "macos")]
+        HostSource::MacPcm(_) => "Core Audio process tap".to_owned(),
     };
     eprintln!(
         "Streaming {source_name} as PCM16 in {frame_count}-frame packets with a {:.1} ms {} / {} target",
@@ -466,6 +525,10 @@ async fn host_audio(
         }
         #[cfg(windows)]
         HostSource::System => stream_wasapi(receivers.clone(), frame_count, None, duration).await?,
+        #[cfg(target_os = "macos")]
+        HostSource::MacPcm(receiver) => {
+            stream_mac_pcm(receivers.clone(), frame_count, receiver, duration).await?
+        }
     };
     eprintln!(
         "Stream complete: {sent} packets sent, {expired} expired under backpressure across {} receivers",
@@ -865,6 +928,72 @@ async fn stream_wasapi(
         "WASAPI complete: {captured_frames} frames, {capture_discontinuities} device discontinuities, {capture_expired} expired capture blocks"
     );
     Ok((sent, network_expired.saturating_add(capture_expired)))
+}
+
+#[cfg(target_os = "macos")]
+async fn stream_mac_pcm(
+    receivers: ReceiverSet,
+    frame_count: u16,
+    mut input: broadcast::Receiver<MacPcmBlock>,
+    duration: Duration,
+) -> Result<(u64, u64)> {
+    while input.try_recv().is_ok() {}
+    let packet_bytes = frame_count as usize * usize::from(CHANNELS) * 2;
+    let packet_period =
+        Duration::from_secs_f64(f64::from(frame_count) / f64::from(LOGICAL_SAMPLE_RATE));
+    let packet_duration_ns =
+        u64::from(frame_count) * 1_000_000_000 / u64::from(LOGICAL_SAMPLE_RATE);
+    let mut media = MediaSender::new(receivers, frame_count);
+    let mut pending = VecDeque::with_capacity(packet_bytes * 4);
+    let started = Instant::now();
+    let mut origin: Option<(u64, u64)> = None;
+    let mut next_source_time_ns = 0;
+    let mut next_send_deadline = None;
+    let mut expired = 0u64;
+    let deadline = Instant::now() + duration;
+    let mut ticker = interval(packet_period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    while Instant::now() < deadline {
+        tokio::select! {
+            received = input.recv() => match received {
+              Ok(block) => {
+                let (first, offset) = *origin.get_or_insert_with(|| {
+                    (block.timestamp_ns, started.elapsed().as_nanos() as u64)
+                });
+                if pending.is_empty() {
+                    next_source_time_ns = next_source_time_ns.max(
+                        offset.saturating_add(block.timestamp_ns.saturating_sub(first))
+                    );
+                }
+                pending.extend(block.pcm);
+                if pending.len() > packet_bytes * 64 {
+                    let dropped = pending.len() - packet_bytes * 32;
+                    pending.drain(..dropped);
+                    expired = expired.saturating_add((dropped / packet_bytes) as u64);
+                }
+              }
+              Err(broadcast::error::RecvError::Lagged(count)) => {
+                expired = expired.saturating_add(count);
+                pending.clear();
+              }
+              Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = ticker.tick() => {
+                let available = pending.len().min(packet_bytes);
+                let mut payload: Vec<u8> = pending.drain(..available).collect();
+                payload.resize(packet_bytes, 0);
+                media.send_paced(
+                    payload,
+                    Some(next_source_time_ns),
+                    &mut next_send_deadline,
+                    packet_period,
+                ).await?;
+                next_source_time_ns = next_source_time_ns.saturating_add(packet_duration_ns);
+            },
+        }
+    }
+    let (sent, network_expired) = media.totals();
+    Ok((sent, network_expired.saturating_add(expired)))
 }
 
 pub async fn receive(invitation: Invitation, output: &Path) -> Result<ReceiveReport> {
